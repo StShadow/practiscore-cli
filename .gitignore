@@ -1,3 +1,83 @@
+# ── Secrets & local data (NEVER commit) ────────────────────────────
+# Session cookies (see README — treat like a password)
+cookie.txt
+cookies.txt
+*.cookie
+.env
+.env.*
+
+# Tool's local state: audit logs (contain shooter emails), resume checkpoints, config
+.practiscore-squads/
+*-audit.jsonl
+*-audit.csv
+*.psq-checkpoint*.json
+
+# ── Python ─────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Test / coverage / type-check caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.dmypy.json
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+
+# Packaging / tooling
+pip-log.txt
+pip-delete-this-directory.txt
+.python-version
+
+# ── Editors / OS ───────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Local fixtures with real data ──────────────────────────────────
+# Committed test fixtures live under tests/fixtures/ with emails scrubbed.
+# Keep any ad-hoc captures out of git:
+scratch/
+*.local.html
+*.local.json
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

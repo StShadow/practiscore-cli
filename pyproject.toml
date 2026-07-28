@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "practiscore-squads"
+version = "0.1.0"
+description = "CLI tool to manage PractiScore match squads (list, move, bulk-move shooters)."
+readme = "README.md"
+requires-python = ">=3.11"
+# license = { file = "LICENSE" }   # add a LICENSE file, then uncomment
+authors = [{ name = "practiscore-squads contributors" }]
+keywords = ["practiscore", "squadding", "cli", "shooting-sports"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Utilities",
+]
+
+# Runtime dependencies — see implementation.md §1
+dependencies = [
+    "requests>=2.31",
+    "beautifulsoup4>=4.12",
+    "lxml>=5.1",
+    "click>=8.1",
+    "rich>=13.7",
+    "tomli-w>=1.0",        # writing config.toml; reading uses stdlib tomllib (3.11+)
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "responses>=0.25",     # HTTP mocking for unit tests
+    "ruff>=0.4",
+]
+
+[project.urls]
+Repository = "https://example.invalid/practiscore-squads"
+
+# Console entry point: `practiscore-squads ...`  (also runnable as `python -m practiscore_squads`)
+[project.scripts]
+practiscore-squads = "practiscore_squads.cli.main:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/practiscore_squads"]
+
+# ── Tooling ────────────────────────────────────────────────────────
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Integration tests that hit the sandbox match are opt-in (see implementation.md §8).
+markers = [
+    "sandbox: hits the live test-reverse-engineer sandbox match; requires PRACTISCORE_COOKIE",
+]
+addopts = "-m 'not sandbox'"
