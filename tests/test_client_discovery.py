@@ -1,10 +1,14 @@
 """Read/discovery surface of SquadClient (F0/F1/F2, spec §5.2)."""
 from __future__ import annotations
 
-from practiscore_squads import Slot
+import pytest
+
+from practiscore_squads import SquadClient, Slot
+from practiscore_squads.client import parse_match_slug
+from practiscore_squads.errors import InvalidMatchError
 
 from tests._data import (
-    ANATOLI, GRZEGORZ, MATCH_ID, SLUG, called_urls,
+    ANATOLI, BASE, COOKIE, GRZEGORZ, MATCH_ID, SLUG, called_urls,
 )
 
 
@@ -74,3 +78,33 @@ def test_roster_uses_list_all_query(make_client):
     c.roster()
     url = [u for u in called_urls(rsps) if "/squads/registered/" in u][-1]
     assert ("%20" in url) or url.rstrip("/").endswith("/ ")
+
+
+# --------------------------- match slug/URL parsing (C3) ------------------- #
+def test_parse_match_slug_accepts_bare_slug():
+    assert parse_match_slug(SLUG) == SLUG
+
+
+def test_parse_match_slug_accepts_full_url():
+    assert parse_match_slug(f"{BASE}/{SLUG}/squadding") == SLUG
+
+
+def test_parse_match_slug_accepts_full_url_with_trailing_slash():
+    assert parse_match_slug(f"{BASE}/{SLUG}/squadding/") == SLUG
+
+
+def test_parse_match_slug_rejects_malformed_url():
+    """A URL-shaped value missing `/squadding` must raise, not become a literal slug."""
+    with pytest.raises(InvalidMatchError):
+        parse_match_slug(f"{BASE}/{SLUG}")
+
+
+def test_parse_match_slug_rejects_url_to_other_path():
+    with pytest.raises(InvalidMatchError):
+        parse_match_slug(f"{BASE}/{SLUG}/results")
+
+
+def test_from_cookie_rejects_malformed_match_url():
+    """Raises before any network call — `parse_match_slug` runs first in `from_cookie`."""
+    with pytest.raises(InvalidMatchError):
+        SquadClient.from_cookie(COOKIE, f"{BASE}/{SLUG}")

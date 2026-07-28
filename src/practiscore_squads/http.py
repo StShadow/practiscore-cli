@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -29,6 +30,18 @@ def _read_at_file(value: str) -> str:
         with open(value[1:], encoding="utf-8") as fh:
             return fh.read().strip()
     return value
+
+
+def _parse_cookie_header(value: str) -> dict[str, str]:
+    """Split a pasted `Cookie:` header value into individual name/value pairs."""
+    pairs: dict[str, str] = {}
+    for part in value.split(";"):
+        part = part.strip()
+        if not part or "=" not in part:
+            continue
+        name, _, val = part.partition("=")
+        pairs[name.strip()] = val.strip()
+    return pairs
 
 
 @dataclass(frozen=True)
@@ -81,7 +94,15 @@ class HttpClient:
             "User-Agent": _BROWSER_UA,
             "X-Requested-With": "XMLHttpRequest",
         })
-        session.headers["Cookie"] = _read_at_file(cookie)
+        # Parsed into the cookie jar (not a static "Cookie" header) so a
+        # `Set-Cookie` the server sends back — e.g. a rotated session id —
+        # updates the jar and is carried on the next request (C5). The domain
+        # must match the host a Set-Cookie response will be scoped to, or the
+        # rotated cookie lands as a second, distinct jar entry instead of
+        # replacing this one — both would then be sent, stale one included.
+        domain = urlparse(base).hostname or ""
+        for name, val in _parse_cookie_header(_read_at_file(cookie)).items():
+            session.cookies.set(name, val, domain=domain)
         return cls(session, base=base, pacer=pacer)
 
     def _url(self, path: str) -> str:

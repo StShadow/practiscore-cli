@@ -160,7 +160,9 @@ Global (put **before** the command):
 | `--yes` / `-y` | Skip the confirmation prompt (for scripting). |
 | `--notify` | **Email** shooters about their move (default: silent — no emails). |
 
-`move-bulk` extras: `--ids a,b,c` or `--ids-file <path>`, `--dry-run` (plan only), `--fresh` (ignore a saved resume checkpoint).
+`move` and `move-bulk` both also take `--dry-run` (print the plan and exit `0` without executing). `move-bulk` extras: `--ids a,b,c` or `--ids-file <path>`, `--fresh` (ignore a saved resume checkpoint).
+
+Exit codes: `0` success · `1` runtime error · `2` usage error · `3` auth/session expired · `4` partial failure (`move` returned `taken`/blocked, or a bulk run had ≥1 failure) · `5` `move-bulk` stopped on throttling (resumable from checkpoint) · `130` declined the confirm prompt.
 
 Full reference: [`implementation.md` §5–§6](./implementation.md).
 
@@ -206,7 +208,7 @@ pytest tests/test_client_move.py::test_move_added -x -v   # one test, verbose, s
 
 Handy flags: `-k <expr>` selects tests by name, `--lf` reruns only the last failures, `-ra` prints a summary of skips/failures.
 
-> **Note:** the tests import the `practiscore_squads` package, so they fail at collection until the `src/` package is implemented — that is the intended starting (red) state for the TDD build. Once the package exists, `pip install -e ".[dev]"` puts it on the path and the imports resolve.
+> **Note:** the package (library core + CLI) is fully implemented — `pip install -e ".[dev]"` puts it on the path and the whole suite runs offline against mocked endpoints. A `sandbox`-marked, opt-in suite also exists for exercising real reads against the `test-reverse-engineer` match; it needs `PRACTISCORE_COOKIE` and is excluded by default (`-m 'not sandbox'`).
 
 > **Interpreter:** any **Python 3.11+** works. If your default `python` is older, invoke a newer one explicitly, e.g. `C:\Python314\python -m pytest`.
 

@@ -3,11 +3,13 @@ from __future__ import annotations
 
 import dataclasses
 import re
+import time
 from collections.abc import Callable
 from urllib.parse import quote
 
 from .errors import (
     AuthError,
+    InvalidMatchError,
     NotAuthorizedError,
     ServerError,
     SlotNotFoundError,
@@ -16,26 +18,45 @@ from .errors import (
     UnexpectedResponseError,
 )
 from .http import HttpClient
-from .models import Cmd, LockState, MoveOutcome, Shooter, Slot
+from .models import Cmd, LockState, MatchSnapshot, MoveOutcome, Shooter, Slot
 from .pacing import Pacer
 from .parsing import BootstrapParser, SearchParser
 
 _MATCH_URL_RE = re.compile(r"^https?://[^/]+/([^/?#]+)/squadding/?.*$", re.IGNORECASE)
+_URL_RE = re.compile(r"^https?://", re.IGNORECASE)
+
+# Local claims (Slot.claimed) keep auto-pick honest about this process's own writes,
+# but they can't see another admin re-squadding concurrently. The squadding UI polls
+# at 120s (§3.8), so matching that bounds how stale our view can get without paying a
+# bootstrap fetch per move (~300 shooters would double the request count).
+SNAPSHOT_TTL = 120.0
 
 
-def _parse_match_slug(value: str) -> str:
+def parse_match_slug(value: str) -> str:
+    """Accept a bare slug or a full squadding URL (F0); reject anything else URL-shaped.
+
+    A malformed URL (e.g. missing `/squadding`) must not be passed through as a
+    literal "slug" — that would silently become a nonsense request path like
+    `/https://practiscore.com/my-match/squadding` (C3).
+    """
     value = value.strip()
     m = _MATCH_URL_RE.match(value)
     if m:
         return m.group(1)
+    if _URL_RE.match(value):
+        raise InvalidMatchError(
+            f"{value!r} looks like a URL but doesn't match "
+            "https://practiscore.com/{slug}/squadding"
+        )
     return value
 
 
 class SquadClient:
-    def __init__(self, http: HttpClient, slug: str):
+    def __init__(self, http: HttpClient, slug: str, *, snapshot_ttl: float = SNAPSHOT_TTL):
         self.http = http
         self.slug = slug
-        self.snapshot = None
+        self.snapshot: MatchSnapshot | None = None
+        self.snapshot_ttl = snapshot_ttl
 
     def __repr__(self) -> str:
         return f"SquadClient(slug={self.slug!r})"
@@ -43,7 +64,7 @@ class SquadClient:
     # --- construction / auth (NF1) --------------------------------------- #
     @classmethod
     def from_cookie(cls, cookie: str, match: str, *, pacer: Pacer | None = None) -> SquadClient:
-        slug = _parse_match_slug(match)
+        slug = parse_match_slug(match)
         http = HttpClient.from_cookie(cookie, pacer=pacer)
         client = cls(http, slug)
         client.refresh()
@@ -57,6 +78,15 @@ class SquadClient:
     def refresh(self) -> None:
         html = self.http.get_bootstrap(self.slug)
         self.snapshot = BootstrapParser().parse(html, self.slug)
+
+    def _refresh_if_stale(self) -> None:
+        """Re-scrape when the snapshot has outlived its TTL (§4.1 "if snapshot stale").
+
+        Drops accumulated `claimed` flags, which is correct — a fresh scrape is server
+        truth and outranks local bookkeeping about writes the server already has.
+        """
+        if time.monotonic() - self.snapshot.fetched_at >= self.snapshot_ttl:
+            self.refresh()
 
     def squads(self) -> dict[int, list[Slot]]:
         return self.snapshot.by_squad()
@@ -110,6 +140,7 @@ class SquadClient:
     # --- single mutation (F3) --------------------------------------------- #
     def move(self, shooter_id: int, squad_no: int,
              position: int | None = None, notify: bool = False) -> MoveOutcome:
+        self._refresh_if_stale()
         squad_ids = self.snapshot.squad_ids()
         if squad_no not in squad_ids:
             raise SlotNotFoundError(f"squad {squad_no} not found")

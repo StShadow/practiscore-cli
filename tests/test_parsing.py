@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 
 from practiscore_squads import LockState
-from practiscore_squads.errors import ServerError, SquaddingError
+from practiscore_squads.errors import ServerError, SquaddingError, UnexpectedResponseError
 from practiscore_squads.parsing import BootstrapParser, SearchParser
 from practiscore_squads.http import Parsed
 
@@ -57,6 +57,25 @@ def test_parse_reserved_and_disabled_slots():
     assert snap.slot(3, 2).free is False
     assert snap.slot(3, 3).disabled is True
     assert snap.slot(3, 3).free is False
+
+
+# --------------------------- malformed pages ------------------------------ #
+def test_page_without_slots_raises():
+    """A non-admin session or a changed layout must fail here, naming the problem —
+    not silently yield match_id=0 and die later on an IndexError inside roster()."""
+    with pytest.raises(UnexpectedResponseError) as exc:
+        BootstrapParser().parse("<html><body>nothing here</body></html>", SLUG)
+    assert "admin access" in str(exc.value)
+
+
+def test_csrf_meta_without_content_attribute_does_not_crash():
+    """The tag can exist without the attribute; that used to be a bare KeyError.
+    An empty token is survivable because CSRF is unenforced (§6.1)."""
+    html = build_bootstrap().replace(f'<meta name="csrf-token" content="{CSRF}">',
+                                     '<meta name="csrf-token">')
+    snap = BootstrapParser().parse(html, SLUG)
+    assert snap.csrf == ""
+    assert len(snap.slots) == 15   # the rest of the page still parses
 
 
 # --------------------------- SearchParser --------------------------------- #

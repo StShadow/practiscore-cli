@@ -26,36 +26,17 @@ class NotAuthorizedError(SquaddingError):
     """removeask == 'noAuth' (unprivileged or unauthenticated session)."""
 
 
-class SlotTakenError(SquaddingError):
-    """cmd == 'taken' — the target slot is already occupied."""
-
-    def __init__(self, num: int):
-        super().__init__(f"slot already taken (squad {num})")
-        self.num = num
-
-
-class AlreadyInSquadError(SquaddingError):
-    """cmd == 'same' — shooter is already in the requested squad."""
-
-    def __init__(self, num: int):
-        super().__init__(f"shooter already in squad {num}")
-        self.num = num
-
-
-class MoveRequiresConfirmationError(SquaddingError):
-    """cmd == 'move' and the caller disabled the confirming save()."""
-
-    def __init__(self, origin: int):
-        super().__init__(f"move requires confirmation (currently in squad {origin})")
-        self.origin = origin
-
-
 class SlotNotFoundError(SquaddingError):
     """squad_no/position not present in the scraped slot set (guards §6.8)."""
 
 
-class SlotUnavailableError(SquaddingError):
-    """Target slot is reserved or disabled."""
+class InvalidMatchError(SquaddingError):
+    """A `--match`/config value looked like a URL but didn't match the squadding pattern."""
+
+
+# NOTE: `taken`, `same`, and `move` are control flow, not faults — they surface as
+# MoveOutcome(ok=...) so single and bulk paths return the same objects (spec §5.2).
+# The exception forms of those states were never raised and have been removed.
 
 
 class ServerError(SquaddingError):

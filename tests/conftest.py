@@ -9,6 +9,7 @@ import pytest
 import responses
 
 from practiscore_squads import SquadClient  # noqa: F401  (drives the red state)
+from practiscore_squads.pacing import Pacer
 
 from tests._data import (
     COOKIE,
@@ -18,6 +19,17 @@ from tests._data import (
     build_bootstrap,
     registered_re,
 )
+
+
+def fast_pacer() -> Pacer:
+    """A Pacer with the inter-request gap removed.
+
+    The production default is 0.8–1.6s per request (NF6: ~300 shooters over
+    10–20 min), which would turn this suite into a ~70s wait for no added
+    coverage. Backoff is left at its real value — tests that exercise the retry
+    path monkeypatch `pacing.time.sleep` instead.
+    """
+    return Pacer(min_gap=0, max_gap=0)
 
 
 @pytest.fixture
@@ -39,7 +51,7 @@ def make_client():
         rsps.add(responses.GET, registered_re(),
                  json=ROSTER if roster is None else roster,
                  content_type="application/json")
-        client = SquadClient.from_cookie(COOKIE, SLUG)
+        client = SquadClient.from_cookie(COOKIE, SLUG, pacer=fast_pacer())
         return client, rsps
 
     yield _make

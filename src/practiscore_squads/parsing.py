@@ -6,7 +6,7 @@ import time
 
 from bs4 import BeautifulSoup
 
-from .errors import ServerError, SquaddingError
+from .errors import ServerError, SquaddingError, UnexpectedResponseError
 from .http import Parsed
 from .models import LockState, MatchSnapshot, Shooter, Slot
 
@@ -18,8 +18,10 @@ class BootstrapParser:
     def parse(self, html: str, slug: str) -> MatchSnapshot:
         soup = BeautifulSoup(html, "lxml")
 
-        csrf_tag = soup.select_one('meta[name="csrf-token"]')
-        csrf = csrf_tag["content"] if csrf_tag else ""
+        # .get(): the tag can exist without the attribute — that used to be a bare
+        # KeyError. An empty token is survivable (CSRF is unenforced, §6.1).
+        csrf = csrf_tag.get("content", "") if (csrf_tag := soup.select_one(
+            'meta[name="csrf-token"]')) else ""
 
         slots: list[Slot] = []
         match_id = 0
@@ -40,6 +42,16 @@ class BootstrapParser:
                 squad_no=squad_no, occupant=occupant,
                 reserved=reserved, disabled=disabled,
             ))
+
+        # No slots means this isn't the admin squadding view we think it is — a
+        # non-admin session, a changed layout, or an error page rendered at 200.
+        # Failing here beats returning match_id=0 and dying later on an IndexError
+        # deep inside roster()/search().
+        if not slots:
+            raise UnexpectedResponseError(
+                "no squad slots found on the squadding page — the session may lack "
+                "admin access to this match, or the page layout changed"
+            )
 
         lock_btn = soup.select_one("#lockSquadding")
         lock = LockState.UNLOCKED

@@ -11,7 +11,7 @@ import time
 
 
 class Pacer:
-    def __init__(self, min_gap: float = 0.05, max_gap: float = 0.2,
+    def __init__(self, min_gap: float = 0.8, max_gap: float = 1.6,
                  backoff_base: float = 2.0, backoff_cap: float = 60.0):
         self.min_gap = min_gap
         self.max_gap = max_gap

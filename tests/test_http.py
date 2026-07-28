@@ -79,3 +79,19 @@ def test_exhausted_timeout_raises_squadding_error():
     responses.add(responses.GET, URL, body=requests.exceptions.Timeout())
     with pytest.raises(SquaddingError):
         _client().get(PATH)
+
+
+# ------------------------- response encoding (NF11) ----------------------- #
+@responses.activate
+def test_body_without_charset_is_decoded_as_utf8():
+    """`_send` forces resp.encoding = "utf-8" — the single line that makes Polish and
+    Cyrillic names survive (NF11).
+
+    requests falls back to Latin-1 for text/* with no charset parameter (RFC 2616), so
+    without that line these bytes come back mojibaked. Nothing else in the suite covers
+    it: the other fixtures pass `str` bodies, which responses labels with a charset.
+    """
+    responses.add(responses.GET, URL,
+                  body="Grzegorz Brzęczyszczykiewicz".encode(),
+                  content_type="text/html")           # deliberately no charset
+    assert _client().get(PATH).text == "Grzegorz Brzęczyszczykiewicz"

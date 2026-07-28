@@ -32,6 +32,7 @@ practiscore-lib/
 └── src/
     └── practiscore_squads/
         ├── __init__.py          # public exports: SquadClient, models, errors
+        ├── __main__.py          # `python -m practiscore_squads` → cli.main:cli (§5)
         ├── errors.py            # exception hierarchy (spec §5.4)
         ├── models.py            # Slot, Shooter, MoveOutcome, MatchSnapshot, Cmd, LockState
         ├── pacing.py            # Pacer: jitter + exponential backoff (NF6)
@@ -177,21 +178,7 @@ class Pacer:
 
 Owns the `requests.Session`, header policy, CSRF, retry, and auth/throttle detection. Knows nothing about squads.
 
-```python
-class HttpClient:
-    def __init__(self, session: requests.Session, base="https://practiscore.com", pacer: Pacer | None = None): ...
-
-    @classmethod
-    def from_cookie(cls, cookie: str) -> "HttpClient":
-        s = requests.Session()
-        s.headers.update({"User-Agent": _BROWSER_UA, "X-Requested-With": "XMLHttpRequest"})
-        s.headers["Cookie"] = _read_at_file(cookie)          # supports "@path" (NF1)
-        return cls(s)
-
-    def get(self, path, *, params=None, expect_json=False) -> Parsed: ...
-    def post(self, path, *, data=None, csrf=True, allow_redirects=True) -> Parsed: ...
-    def get_bootstrap(self, slug) -> str: ...                # GET /{slug}/squadding, follows redirects
-```
+Constructed either directly (`HttpClient(session, base=..., pacer=...)`) or via the `from_cookie(cookie, base=..., pacer=...)` classmethod, which builds a fresh `requests.Session`, sets a browser-like `User-Agent` and `X-Requested-With: XMLHttpRequest`, and parses the pasted cookie value (plain or `@file`, NF1) into the session's cookie jar — not a static `Cookie` header — so a `Set-Cookie` the server sends back (e.g. a rotated session id) updates the jar instead of being silently discarded (C5). `get(path, *, headers=None)` and `post(path, *, data=None, csrf=None, headers=None, allow_redirects=True)` both return a `Parsed(status, json, text)`; `csrf` is the token string itself (not a bool) — when given, it is sent as `X-CSRF-TOKEN`. `get_bootstrap(slug)` issues `GET /{slug}/squadding` and returns the raw HTML.
 
 Responsibilities & rules:
 - **Headers (spec §5.5):** always `X-Requested-With: XMLHttpRequest` (turns error pages into `{"message":"Server Error"}`), browser-like `User-Agent`, and for writes `Content-Type: application/x-www-form-urlencoded`.
@@ -226,8 +213,9 @@ The public library entry point. Holds one `HttpClient` and the latest `MatchSnap
 - **`from_cookie(cookie, match)`** builds `HttpClient.from_cookie`, stores the parsed slug (accepts slug or full URL via `config.parse_match`), calls `refresh()`.
 - **`refresh()`** = `get_bootstrap` → `BootstrapParser.parse` → replace `self.snapshot`. Every read/mutation uses the snapshot; callers refresh before batches.
 - **`search(q, literal=True)`** escapes `%`→`\%`, `_`→`\_` when literal; reuses one valid slot id (any squad; §3.2 scoping). `roster()` = `search("%20", literal=False)`. `squad_members(no)` filters the snapshot's occupied slots and correlates names (best-effort; IDs come from `roster()`).
+  - **D6 — two known limits of this name correlation, both structural (no scraped field ties an occupant slot to a roster ID):** (1) it matches roster shooters to snapshot occupants **by display name**, so two shooters sharing a name mis-attribute — one may be reported as occupying the other's slot. (2) a slot this process just filled via `move()`/`move_many()` is marked non-free locally (`Slot.claimed`, §3.1) but carries no `occupant` name until the next `refresh()`, so `free_slots()` correctly excludes it while `squad_members()` does not yet include it — the two views briefly disagree about the same write.
 - **`move(shooter_id, squad_no, position=None, notify=False)`** — the safety-critical path (NF10). Algorithm in §4.1.
-- **`move_many(...)`** delegates the loop shape to `BulkMover` but is exposed here too; the core version applies pacing and returns `MoveOutcome`s without touching disk (checkpoint/audit are CLI concerns injected via callbacks).
+- **`move_many(...)`** **owns** the batch loop: slot pre-assignment, pacing, continue-and-report, and the `skip=`/`on_progress=` hooks. It never touches disk — `BulkMover` layers checkpoint and audit on top via those hooks (§3.6). The dependency runs one way only (`bulk ─► client`, §2); the core never calls up into `BulkMover`.
 - **`ensure_locked()`** reads `snapshot.lock`; toggles only if `UNLOCKED`; returns whether it locked (NF7).
 
 `SquadClient` **raises** only hard faults (`AuthError`, `SessionExpiredError`, `ServerError`, `UnexpectedResponseError`); control-flow states (`taken`, `same`) become `MoveOutcome(ok=...)`.
@@ -258,29 +246,33 @@ class MovePlanner:
         # target slot exists; classify without mutating.
 ```
 
-**`bulk.py`** — `BulkMover` executes a `MovePlan` with progress, checkpoint skip, audit, and pacing (F4/NF5/NF6).
+**`bulk.py`** — `BulkMover` is a **thin wrapper** over `SquadClient.move_many`. The loop, pacing, and continue-and-report semantics live in the core; `BulkMover` only adds the two disk-backed concerns the core refuses to know about — checkpoint and audit (F4/NF5/NF6).
 
 ```python
 class BulkMover:
     def __init__(self, client, checkpoint: Checkpoint, audit: AuditLog, on_progress=None): ...
     def run(self, plan: MovePlan, *, notify=False) -> list[MoveOutcome]:
         done = self.checkpoint.load()                    # resume (NF6)
-        outcomes = []
-        for i, pm in enumerate(plan.actionable(), 1):
-            if pm.shooter_id in done: continue
-            try:
-                oc = self.client.move(pm.shooter_id, plan.target_squad, notify=notify)
-            except SessionExpiredError:
-                raise                                    # bubble to CLI pause-and-resume (NF2)
+        ids = [pm.shooter_id for pm in plan.actionable()]
+
+        def _progress(oc, i, total):
+            # Runs per attempt, BEFORE any batch-fatal raise — so a run that aborts
+            # still leaves a complete checkpoint + audit trail behind it.
             self.audit.write(oc)                         # emails included (NF8)
-            if oc.ok: self.checkpoint.record(pm.shooter_id)
-            outcomes.append(oc)
-            if self.on_progress: self.on_progress(oc, i, len(plan.actionable()))
-        self.checkpoint.clear()                          # clean finish
+            if oc.ok: self.checkpoint.record(oc.shooter_id)
+            if self.on_progress: self.on_progress(oc, i, total)
+
+        outcomes = self.client.move_many(ids, plan.target_squad, notify=notify,
+                                         skip=done, on_progress=_progress)
+        self.checkpoint.clear()                          # clean finish only
         return outcomes
 ```
 
-Continue-and-report: a per-item `taken`/`same` yields `MoveOutcome(ok=False/True)` and never aborts the loop (NF5). Only `SessionExpiredError` breaks out, and the checkpoint preserves progress.
+**Continue-and-report (NF5):** a per-item `taken`/`same`/`blocked`, or any other `SquaddingError`, becomes a `MoveOutcome` and never aborts the loop.
+
+**Batch-fatal (NF2/NF6):** `AuthError` (incl. `SessionExpiredError`) and `ThrottledError` propagate out of `move_many`. A dead session cannot recover without a new cookie, and rate limiting only worsens if every remaining shooter burns another retry budget against it (~15s each — roughly 75 min over the spec's 300-shooter target). `TransportError` is *not* batch-fatal: it is recorded per item, since an isolated host blip should not end a run.
+
+Because `checkpoint.clear()` sits after the call, a batch-fatal raise leaves the checkpoint intact and the run resumes from it.
 
 **`lock.py`**
 
@@ -347,7 +339,7 @@ class JsonFormatter:   # json.dump to stdout for --json
 
 ```
 move(shooter_id, squad_no, position=None, notify=False):
-    if snapshot stale: refresh()
+    if snapshot older than SNAPSHOT_TTL: refresh()      # `_refresh_if_stale`, §3.5
     squad_id = snapshot.squad_ids()[squad_no]          # else SlotNotFoundError
     slot = chosen scraped slot:
         - if position given: snapshot.slot(squad_no, position) or SlotNotFoundError   # blocks out-of-range (§6.8)
@@ -355,16 +347,18 @@ move(shooter_id, squad_no, position=None, notify=False):
     if not slot.free: return MoveOutcome(ok=False, "taken")                            # never save onto occupancy (§3.4)
     r = POST /squads/check/{slot.as_squad()}/{shooter_id}   body email=0|1
     match r.cmd:
-        "added": verify via refresh; return MoveOutcome(ok=True, to=squad_no, detail="added")
+        "added": claim slot locally; return MoveOutcome(ok=True, to=squad_no, detail="added")
         "same" : return MoveOutcome(ok=True,  to=squad_no, detail="already there")     # idempotent
         "taken": return MoveOutcome(ok=False, to=squad_no, detail="taken")
         "move" : from_no = r.num
                  b = POST /squads/save/{slot.as_squad()}/{shooter_id}  body send=no|yes
                  if b.strip() != "moved": raise UnexpectedResponseError                # §3.4 guard
-                 refresh(); return MoveOutcome(ok=True, from=from_no, to=squad_no, detail="moved")
+                 claim slot locally; return MoveOutcome(ok=True, from=from_no, to=squad_no, detail="moved")
 ```
 
 Only `save` when `check` said `move`; only ever target a scraped, free slot. These two rules neutralize the double-assignment (§3.4) and hidden-out-of-range (§6.8) hazards.
+
+**D2 — claim-plus-TTL, not refresh-per-write.** A committed `added`/`move` does not trigger an immediate `refresh()` to "verify" the write — that would cost a full bootstrap fetch per move (~300 shooters would double the request count, NF6). Instead the target `Slot` is marked `claimed=True` in the in-memory snapshot (`SquadClient._claim_slot`), which is enough for `free_slots()`/auto-pick to stop re-offering a slot this process just filled. The snapshot as a whole is only re-scraped when it exceeds `SNAPSHOT_TTL` (120s, matching the page's own 120s self-refresh, §3.1) via `_refresh_if_stale()`, called at the top of `move()`. A real `refresh()` always **discards** accumulated `claimed` flags — server truth outranks local bookkeeping, since another admin or the public UI may have mutated the same squad meanwhile (§3.8).
 
 ### 4.2 Bulk move with resume & session expiry (F4/NF2/NF6)
 
@@ -379,20 +373,24 @@ sequenceDiagram
     CLI->>C: refresh(); LockManager.ensure()
     CLI->>CLI: MovePlanner.plan() -> print dry-run
     U-->>CLI: confirm (or --yes)
-    loop each actionable shooter
-        BM->>CK: skip if in done
-        BM->>C: move(id, 3)
-        alt SessionExpiredError
+    CLI->>BM: run(plan)
+    BM->>CK: load() -> done
+    BM->>C: move_many(ids, 3, skip=done, on_progress=_progress)
+    loop each shooter not in done
+        C->>C: move(id, 3)
+        alt AuthError / ThrottledError (batch-fatal)
             C-->>BM: raise
-            BM-->>CLI: bubble
-            CLI-->>U: "session expired — paste fresh cookie"
+            BM-->>CLI: bubble (checkpoint NOT cleared)
+            CLI-->>U: "session expired — paste fresh cookie" / "rate limited — resume later"
             U-->>CLI: new cookie
-            CLI->>C: rebuild session; continue (done set preserved)
-        else outcome
+            CLI->>C: rebuild session; re-run (done set preserved)
+        else outcome (incl. TransportError)
+            C->>BM: _progress(outcome, i, total)
             BM->>CK: record(id) if ok
             BM->>BM: audit.write; on_progress(bar)
         end
     end
+    C-->>BM: outcomes
     BM->>CK: clear()
     CLI->>U: results table + Lock: LOCKED (locked by this run)
 ```
@@ -407,7 +405,7 @@ sequenceDiagram
 
 Invocation (v1): `python -m practiscore_squads <global-opts> <command> <args>` (a `practiscore-squads` console-script alias is defined in `pyproject.toml`).
 
-Exit codes: `0` success · `1` runtime error (network, parse) · `2` usage error (click) · `3` auth/session (bad or expired cookie, unresolved) · `4` partial failure (bulk completed but ≥1 move failed) · `130` user aborted at confirm.
+Exit codes: `0` success · `1` runtime error (network, parse) · `2` usage error (click) · `3` auth/session (bad or expired cookie, unresolved) · `4` partial failure (`move` returned `taken`/blocked, or a bulk run completed with ≥1 move failed) · `5` throttled — `move-bulk` stopped on a batch-fatal `ThrottledError` (§3.6); partial and resumable from the checkpoint · `130` user aborted at confirm.
 
 ### 5.1 `config set-default`
 
@@ -419,7 +417,6 @@ practiscore-squads config set-default --match https://practiscore.com/test-rever
 ```
 
 - Writes `default_match` (normalized to slug) to `~/.practiscore-squads/config.toml`.
-- `config show` (companion) prints current config (never the cookie value).
 
 ### 5.2 `squads` — list all squads (F1)
 
@@ -467,12 +464,13 @@ ID        Name                          Div         Squad
 practiscore-squads move 9808574 --to 3
 practiscore-squads move 9808574 --to 3 --position 2
 practiscore-squads move 9808574 --to 3 --yes --notify
+practiscore-squads --json move 9808574 --to 3 --dry-run
 ```
 
 - Moves one shooter (by ID) to a displayed squad number; `--position` optional (default first free slot).
-- **Locks** the match if unlocked (NF7), prints a **dry-run** line and asks to confirm (NF5) unless `--yes`.
+- **Locks** the match if unlocked (NF7), prints a **dry-run** line and asks to confirm (NF5) unless `--yes`. `--dry-run` (D5) prints the plan and exits `0` without executing — same as `move-bulk --dry-run`, and works with `--json`.
 - On success prints the outcome and the lock-status line.
-- Errors like `taken`/`already there` are reported (not a crash); a real fault exits non-zero.
+- **Exit codes (D4):** `0` for `moved`/`added`/`already there`; `4` for `taken` or `blocked: squad full` — so `move … && echo ok` only reports success when a shooter actually ended up in the target squad. A hard fault (`AuthError`, `ServerError`, etc.) still exits per the codes in §5.
 
 ### 5.5 `move-bulk` — bulk move (F4)
 
@@ -488,6 +486,7 @@ practiscore-squads --json move-bulk --to 3 --ids-file squad3.txt --dry-run
 - **Resumable:** re-running the same `--to`/ids after an interruption skips already-done shooters (NF6). `--fresh` ignores/clears any existing checkpoint.
 - **Continue-and-report:** finishes all it can; prints a table of failures with reasons (NF5). Exit code `4` if any failed.
 - **Session expiry:** pauses and prompts for a fresh cookie mid-run, then resumes (NF2).
+- **Throttled abort (D3):** a `ThrottledError` is batch-fatal (§3.6) and stops the run; exit code `5` — the checkpoint is left intact, so the same command resumes where it stopped once rate limiting clears.
 
 Results summary:
 
@@ -502,6 +501,8 @@ Audit: ~/.practiscore-squads/audit/test-reverse-engineer.jsonl
 ## 6. CLI options
 
 ### 6.1 Global options (apply to every command; place before the command)
+
+`--yes` and `--notify` are additionally declared on `move` and `move-bulk`, so they are accepted **on either side** of the command name (see the note under §6.2). Every other option in this table is group-level only and must precede the command.
 
 | Option | Arg | Default | Requirement | Meaning |
 |---|---|---|---|---|
@@ -524,14 +525,17 @@ Audit: ~/.practiscore-squads/audit/test-reverse-engineer.jsonl
 | `shooters` | `--squad` | `<N>` | all | Limit to one displayed squad (F2). |
 | `move` | `--to` | `<N>` | — (required) | Destination displayed squad number (F3). |
 | `move` | `--position` | `<P>` | first free | Specific slot position within the target squad. |
+| `move` | `--dry-run` | flag | off | Print the plan and exit without executing (works with `--json`; D5). |
 | `move-bulk` | `--to` | `<N>` | — (required) | Destination squad for the whole batch (F4). |
 | `move-bulk` | `--ids` | `a,b,c` | — | Inline shooter IDs (mutually exclusive with `--ids-file`). |
 | `move-bulk` | `--ids-file` | `<path>` | — | File of shooter IDs, one per line (`#` comments ok). |
 | `move-bulk` | `--dry-run` | flag | off | Print the plan and exit without executing (works with `--json`). |
 | `move-bulk` | `--fresh` | flag | off | Ignore and clear any existing resume checkpoint (NF6). |
+| `move`, `move-bulk` | `--yes` / `-y` | flag | off | Command-level twin of the global flag (§6.1); accepted on either side of the command name. |
+| `move`, `move-bulk` | `--notify` | flag | off | Command-level twin of the global flag (§6.1); accepted on either side of the command name. |
 
 Notes:
-- `--yes` and `--notify` are **global** because they apply identically to `move` and `move-bulk`; putting them before the command keeps behavior uniform.
+- `--yes` and `--notify` are declared **at both levels** — on the group (§6.1) *and* on `move`/`move-bulk` — so both `--yes move-bulk …` and `move-bulk … --yes` parse. Click gives each level its own parameter, so the command-level value wins when supplied; when it is absent the group-level value carries through the click context. Both flags default to off, so the effective rule is simply **either position turns it on**. This is why the examples in §5.4/§5.5 place them after the command while §5.2/§5.3 place `--json` before it — `--json` is group-only.
 - `--to`/`--position`/`--squad` are **displayed** numbers (F0); the tool maps them to internal `squad_id`.
 - On any mutating command, if the resolved session is unauthenticated the tool exits `3` with guidance to refresh the cookie (see the Firefox/Chrome how-to, NF1) — that how-to ships in `README.md`, not this file.
 
@@ -580,3 +584,63 @@ Loaded only when `slug`+`target_squad`+`notify` match the current run; deleted o
 6. `lock`, `config`, `formatting`.
 7. `cli` — wire it together; `CliRunner` tests.
 8. `README.md` with the Firefox/Chrome cookie how-to (NF1).
+
+---
+
+## 10. Backlog
+
+**Status:** steps 1–3 of §9 are done — `models`, `errors`, `pacing`, `http`, `parsing`, `client` are implemented with 89 passing tests. Steps 4–8 are unbuilt: `planner`, `bulk`, `lock`, `checkpoint`, `audit`, `config`, `formatting`, and the whole `cli/` package exist only as designs in §3.6/§3.7.
+
+Each task below is self-contained: it names its own files and its own definition of done, and can be picked up without any other task being finished first. Where a genuine ordering constraint exists it is stated as **Needs:**; everything without that line is unblocked today.
+
+### 10.1 Documentation alignment
+
+- [ ] **D1 — Replace the `HttpClient` signature block with prose.** §3.3's code block has drifted from `http.py` (it shows `get(path, *, params, expect_json)` and `csrf=True`; the code has `get(path, *, headers)` and `csrf: str | None` carrying the token). Describe the responsibilities in prose so there is no second signature to keep in sync. *Done when:* §3.3 contains no Python signature block and the surrounding rules still cover headers, CSRF, retry, auth detection, and redirects.
+- [ ] **D2 — Update §4.1 for the claim-plus-TTL model.** The pseudocode still says `verify via refresh` and `refresh()` after each committed write. The implementation marks the target slot `claimed` locally and only re-scrapes when the snapshot exceeds `SNAPSHOT_TTL`. *Done when:* §4.1 describes local claiming, the TTL trigger, and the fact that a refresh discards claims because server state outranks local bookkeeping.
+- [ ] **D3 — Add exit code `5` for a throttle-aborted run.** §5's exit-code list has no entry for a bulk run that stops on `ThrottledError`, which is now batch-fatal (§3.6). *Done when:* `5` is defined as "throttled — partial, resumable from checkpoint" in §5 and referenced from §5.5.
+- [ ] **D4 — Specify `move` exit codes.** §5.4 currently says only that "a real fault exits non-zero", which leaves a `taken` result exiting `0` — so `move … && echo ok` reports success when nothing moved. *Done when:* §5.4 states `4` for `taken`/`blocked` and `0` for `already there`.
+- [ ] **D5 — Add `--dry-run` to `move`.** `move-bulk` has one; `move` has only an interactive confirm. *Done when:* §5.4 shows an example and §6.2 has the row.
+- [ ] **D6 — Document the `squad_members()` correlation limits.** It matches roster IDs to snapshot occupants **by name**, so same-named shooters mis-attribute; and a slot filled by this process is non-free but still nameless until the next refresh, so `free_slots()` sees a write that `squad_members()` does not. *Done when:* §3.5 states both limits.
+
+### 10.2 Core library
+
+- [ ] **C1 — Test the TTL staleness refresh.** `SquadClient._refresh_if_stale()` and `SNAPSHOT_TTL` shipped without a test; nothing pins that an expired snapshot re-scrapes or that a fresh one does not. *Done when:* tests cover both directions (construct with `snapshot_ttl=0` to force, and the default to suppress) and assert the bootstrap request count.
+- [ ] **C2 — Prove the UTF-8 guard actually guards.** `test_body_without_charset_is_decoded_as_utf8` passes today, but it has not been shown to fail with `resp.encoding = "utf-8"` removed from `http.py::_send` — an assertion that passes either way is worthless. *Done when:* the line has been temporarily removed, the test observed failing, and the line restored.
+- [ ] **C3 — Reject malformed match URLs.** `_parse_match_slug` passes non-matching input through verbatim, so `https://practiscore.com/my-match` (no `/squadding`) becomes a slug literally equal to that URL, producing a nonsense request path. *Done when:* URL-shaped input that does not match the squadding pattern raises, with a test.
+- [ ] **C4 — Verify the `LIKE` escaping assumption.** `search(literal=True)` escapes `%`/`_` with a backslash, but spec §3.2's verification log never confirmed the backend honours `\` escapes — if it does not, literal searches for names containing `_` silently return the wrong rows. *Done when:* the behaviour is checked against the sandbox and either confirmed in `spec.md` or the escaping strategy is corrected. **Needs:** a sandbox session (§8).
+- [ ] **C5 — Preserve rotated session cookies.** `HttpClient.from_cookie` sets `Cookie` as a session header, which suppresses the cookie jar, so any `Set-Cookie` the server sends is silently discarded. Harmless while Laravel does not rotate the session mid-run; breaks the run if it starts to. *Done when:* the pasted header is parsed into `session.cookies` instead, with a test that a server-set cookie survives to the next request.
+
+### 10.3 Orchestration layer (§3.6)
+
+- [ ] **O1 — `checkpoint.py`.** JSON store per §3.6/§7; `load()` honours the slug+target+notify guard, `record()` appends, `clear()` deletes. Pure filesystem, no network. *Done when:* unit-tested against a `tmp_path`, including the guard rejecting a mismatched run.
+- [ ] **O2 — `audit.py`.** Append-only JSONL/CSV writer per §3.6/§7. Emails included by owner choice (NF8), file kept local, `chmod 600` on POSIX. *Done when:* unit-tested for both formats and for the permission bits.
+- [ ] **O3 — `planner.py`.** `MovePlanner.plan()` classifies each shooter as move/add/noop/blocked without mutating (§3.6). *Done when:* unit-tested over a fixture snapshot covering all four classifications.
+- [ ] **O4 — `lock.py`.** `LockManager.ensure()` wrapping `client.ensure_locked()` into a `LockReport` (§3.6). Never auto-unlocks. *Done when:* unit-tested for both already-locked and locked-by-this-run.
+- [ ] **O5 — `bulk.py`.** `BulkMover` as the thin wrapper specified in §3.6 — checkpoint and audit layered onto `client.move_many` via `on_progress`, nothing else. *Done when:* tested that a batch-fatal raise leaves the checkpoint intact and a clean finish clears it. **Needs:** O1, O2.
+
+### 10.4 CLI layer (§3.7, §5, §6)
+
+- [ ] **U1 — `config.py`.** TOML load/save plus `resolve_match`, `parse_match`, `resolve_cookie` with the precedence chains in §4.3. *Done when:* unit-tested for each precedence chain including the "no match" error.
+- [ ] **U2 — `formatting.py`.** `TableFormatter` and `JsonFormatter` behind one Protocol (§3.7). Email omitted in both (NF9). *Done when:* tested that no renderer emits an email and that `--json` shapes match §5.2–§5.5.
+- [ ] **U3 — `cli/main.py`.** click group, the §6.1 global options, and a lazy `SquadClient` factory so read commands do not build a session until needed. *Done when:* `--help` and `--version` work with no cookie present.
+- [ ] **U4 — `cli/commands.py`.** The five commands of §5. *Done when:* `CliRunner` covers option parsing, dry-run/confirm gating, `--json` shape, and every exit code in §5. **Needs:** U1, U2, U3, and O1–O5 for `move-bulk`.
+- [ ] **U5 — `__main__.py`.** Two lines delegating to `cli.main:cli`, so the `python -m practiscore_squads` form advertised in §5 and `README.md` actually runs. *Done when:* `python -m practiscore_squads --help` exits 0. **Needs:** U3.
+
+### 10.5 Packaging & tooling
+
+- [ ] **P1 — Confirm `py.typed` ships.** The marker file exists but has not been verified to land in a built wheel under the hatchling config. *Done when:* a `python -m build` (or `hatch build`) wheel is inspected and contains `practiscore_squads/py.typed`.
+- [ ] **P2 — Sandbox integration suite.** The `sandbox` pytest marker is declared in `pyproject.toml` and deselected by default, but no test uses it. *Done when:* at least one opt-in test exercises a read path against `test-reverse-engineer` per the §8 discipline (restore initial layout, `email=0`/`send=no` throughout).
+- [ ] **P3 — Update `README.md` once the CLI exists.** It documents five commands and their flags as though shipped; today none of them run. *Done when:* README either matches the built CLI or carries a prominent "library core only — CLI in progress" note.
+
+### 10.6 Decided — no action
+
+Recorded so they are not re-litigated. Reopen only with a reason.
+
+| Item | Decision |
+|---|---|
+| `remove()` post-condition re-read (spec §3.6) | **Deferred** — `remove()` is not a v1 CLI command. |
+| Audit CLI flags (`--audit-dir`, `--no-audit`) | **Not adding** — config file only. |
+| Response bodies in exception messages (NF9) | **Leaving as-is.** Newer errors already omit bodies; older ones interpolate them. |
+| Unused exception classes | **Deleted** — `taken`/`same`/`move` are control flow, not faults. |
+| ~25 ruff errors under `tests/` | **Leaving as-is** — all ten test files share the flagged import convention. |
+| Empty `src/practiscore_squads/cli/` | **Keeping** as the placeholder for U3/U4. |

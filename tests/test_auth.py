@@ -43,3 +43,23 @@ def test_cookie_never_appears_in_repr():
     c = SquadClient.from_cookie(COOKIE, SLUG)
     assert "laravel_session" not in repr(c)
     assert "cf_clearance" not in repr(c)
+
+
+@responses.activate
+def test_rotated_session_cookie_survives_to_next_request():
+    """C5: a `Set-Cookie` from the server must update the jar, not be discarded.
+
+    Pasting the cookie as a static `Cookie:` header (rather than into the jar)
+    would suppress the jar entirely, so a rotated `laravel_session` the server
+    sends back is silently dropped and the next request replays the stale value.
+    """
+    responses.add(
+        responses.GET, bootstrap_url(), body=build_bootstrap(), content_type="text/html",
+        headers={"Set-Cookie": "laravel_session=rotated; Path=/"},
+    )
+    responses.add(responses.GET, registered_re(), json=ROSTER, content_type="application/json")
+    c = SquadClient.from_cookie(COOKIE, SLUG)
+    c.roster()
+    second_cookie = responses.calls[1].request.headers.get("Cookie", "")
+    assert "laravel_session=rotated" in second_cookie
+    assert "laravel_session=sess" not in second_cookie
