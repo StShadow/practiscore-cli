@@ -29,6 +29,10 @@ def error_boundary():
         yield
     except config_mod.NoDefaultMatchError as exc:
         _fail(str(exc), 2)
+    except config_mod.ConfigError as exc:
+        # Bad config.toml / unreadable @cookie file: the operator's input is wrong,
+        # so it exits like any other usage error instead of as a traceback.
+        _fail(str(exc), 2)
     except InvalidMatchError as exc:
         _fail(str(exc), 2)
     except AuthError as exc:
@@ -86,4 +90,7 @@ class Context:
 @click.pass_context
 def cli(ctx: click.Context, match, cookie, json_output, yes, notify, quiet, verbose):
     """PractiScore squadding CLI — list, move, and bulk-move shooters between squads."""
-    ctx.obj = Context(match, cookie, json_output, yes, notify, quiet, verbose)
+    # Inside the boundary: Context reads config.toml, so a malformed one must exit 2
+    # here rather than escape the group callback as an unhandled TOMLDecodeError.
+    with error_boundary():
+        ctx.obj = Context(match, cookie, json_output, yes, notify, quiet, verbose)

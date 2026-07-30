@@ -5,10 +5,12 @@ Pure aside from the reads it triggers on `client` (`refresh()`, `roster()`,
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 from .client import SquadClient
 from .errors import SlotNotFoundError
+from .models import Shooter
 
 MOVE = "move"
 ADD = "add"
@@ -48,12 +50,16 @@ class MovePlanner:
     def __init__(self, client: SquadClient):
         self.client = client
 
-    def plan(self, shooter_ids: list[int], squad_no: int) -> MovePlan:
+    def plan(self, shooter_ids: list[int], squad_no: int, *,
+             roster: Iterable[Shooter] | None = None) -> MovePlan:
+        """`roster` lets a caller that already holds one (the CLI needs it for the
+        audit log too, NF8) pass it in rather than pay a second fetch for it."""
         self.client.refresh()
         if squad_no not in self.client.snapshot.squad_ids():
             raise SlotNotFoundError(f"squad {squad_no} not found")
 
-        roster = {s.id: s for s in self.client.roster()}
+        shooters = self.client.roster() if roster is None else roster
+        roster_by_id = {s.id: s for s in shooters}
         name_to_squad = name_to_squad_map(self.client)
 
         # Free-slot budget decremented as actionable moves are provisionally
@@ -63,7 +69,7 @@ class MovePlanner:
 
         moves: list[PlannedMove] = []
         for sid in shooter_ids:
-            shooter = roster.get(sid)
+            shooter = roster_by_id.get(sid)
             name = shooter.name if shooter else f"#{sid}"
             current = name_to_squad.get(shooter.name) if shooter else None
 

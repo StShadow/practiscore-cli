@@ -8,7 +8,8 @@ version = "0.1.0"
 description = "CLI tool to manage PractiScore match squads (list, move, bulk-move shooters)."
 readme = "README.md"
 requires-python = ">=3.11"
-# license = { file = "LICENSE" }   # add a LICENSE file, then uncomment
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "practiscore-squads contributors" }]
 keywords = ["practiscore", "squadding", "cli", "shooting-sports"]
 classifiers = [

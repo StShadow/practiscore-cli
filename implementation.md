@@ -185,7 +185,8 @@ Responsibilities & rules:
 - **CSRF:** inject `X-CSRF-TOKEN` from the current snapshot on writes; caller passes the token in. Even though unenforced (§6.1) — future-proofing. On `419`, signal the client to `refresh()` and retry once.
 - **Response handling (spec §5.5):** never branch on `Content-Type`. Return a small `Parsed(status, json, text)` where `json` is `json.loads(text)` attempted-and-ignored. `check` success is `text/html` holding JSON (§8.2), so this must not depend on content type.
 - **Auth detection (NF2):** a `302 → /login` on the bootstrap, or a login-page body on a gated route, raises `SessionExpiredError`. A `403`/Cloudflare interstitial raises `ThrottledError` → retry with `pacer.penalize`.
-- **Retry loop:** transient (`429`, `503`, connection error) → up to N attempts with `pacer.penalize`. `removeshooter`'s ambiguous `503`-vs-redirect (§3.6) is handled by treating any `3xx`/opaque redirect as success and verifying via re-read rather than trusting the status.
+- **Retry loop:** transient (`429`, `503`, connection error) → up to N attempts with `pacer.penalize`. Replaying `check`/`save` is harmless (a repeat lands on `same`/`moved`), which is why the retry is safe to apply to those writes.
+- **Opting out of the throttle retry:** `post(..., retry_throttle=False)` returns a `429`/`503` to the caller instead of retrying it. `removeshooter` uses this: spec §3.6 records a `503` reported for a removal that **succeeded**, so retrying re-POSTs a mutation against a status that never meant failure. The client resolves the ambiguity by re-reading instead — see §4.3.
 - **Redirects:** `post(..., allow_redirects=False)` for `removeshooter`; treat `3xx` as success.
 
 ### 3.4 `parsing.py`
@@ -241,9 +242,12 @@ class MovePlan:
 
 class MovePlanner:
     def __init__(self, client: SquadClient): ...
-    def plan(self, shooter_ids: list[int], squad_no: int) -> MovePlan:
+    def plan(self, shooter_ids: list[int], squad_no: int, *,
+             roster: Iterable[Shooter] | None = None) -> MovePlan:
         # refresh(); for each id determine current squad (from roster/snapshot) and whether a free
         # target slot exists; classify without mutating.
+        # `roster` is an optional injection point: the CLI needs the same rows for the audit
+        # log (NF8), so it fetches once and passes them in rather than paying a second search.
 ```
 
 **`bulk.py`** — `BulkMover` is a **thin wrapper** over `SquadClient.move_many`. The loop, pacing, and continue-and-report semantics live in the core; `BulkMover` only adds the two disk-backed concerns the core refuses to know about — checkpoint and audit (F4/NF5/NF6).
@@ -283,16 +287,23 @@ class LockReport:
     locked_by_this_run: bool
 
 class LockManager:
-    def ensure(self, client: SquadClient) -> LockReport:
+    def ensure(self, client: SquadClient) -> LockReport:      # locks iff unlocked
         locked_now = client.ensure_locked()
         return LockReport(LockState.LOCKED, locked_now)
+
+    def report(self, client: SquadClient) -> LockReport:      # read-only; no toggle
+        return LockReport(client.snapshot.lock, False)
 ```
 
 CLI prints the report at the end; **never auto-unlocks** (NF7).
 
+`report()` exists for `--dry-run`, which is specified as printing the plan and exiting **without executing**. Toggling the lock is a real mutation and one the tool never reverses, so a dry run reports the state it found rather than locking the match on the operator's behalf. For the same reason `ensure()` is called **after** the confirmation prompt, not before it — declining at the prompt must leave the match exactly as it was found.
+
 **`checkpoint.py`** — JSON file `~/.practiscore-squads/checkpoints/<slug>-to<squad>.json` (or CWD fallback): `{ "slug", "target_squad", "notify", "done": [ids], "updated": iso }`. `load()` returns the `done` set only if slug+target+notify match the current run (else ignored). `clear()` deletes on clean finish. Distinct from audit (NF6).
 
 **`audit.py`** — append-only JSONL (default) or CSV at `~/.practiscore-squads/audit/<slug>.jsonl`. One record per attempted move: `timestamp, shooter_id, name, email, from_squad, to_squad, outcome, notify`. **Emails included** by owner choice (NF8); file kept local, never network-sent, `chmod 600` on POSIX. `AuditLog.write(MoveOutcome)` resolves the shooter's name/email from a roster cache.
+
+NF8 says *every* attempted move, so **both** mutating commands audit: `move-bulk` via `BulkMover`'s `on_progress` hook, and `move` by writing the single outcome directly (§5.4). Failed attempts are recorded too — a `taken` that never happened is exactly the kind of thing an operator later needs to reconstruct.
 
 ### 3.7 CLI layer
 
@@ -306,12 +317,16 @@ class Config:
     audit_dir: Path
     audit_format: str             # "jsonl" | "csv"
 
+class ConfigError(ValueError): ...                 # unreadable/malformed config.toml or @cookie file
+
 def load() -> Config: ...                          # TOML at ~/.practiscore-squads/config.toml
 def save(cfg: Config) -> None: ...
 def resolve_match(cli_value, cfg) -> str:          # F0: --match > default > error
 def parse_match(value: str) -> str:                # slug or https://practiscore.com/{slug}/squadding -> slug
 def resolve_cookie(cli_value, cfg) -> str:         # NF1: --cookie > env PRACTISCORE_COOKIE > config > prompt
 ```
+
+`ConfigError` keeps bad *operator input on disk* out of the library's fault hierarchy: nothing is wrong with the API or the session, so a malformed `config.toml` or a missing `@cookie.txt` surfaces as the usage exit code (`2`) with a readable message rather than a raw `TOMLDecodeError`/`OSError` traceback. Because `Context` reads the config in the click **group** callback, that callback body runs inside `error_boundary()` too — otherwise the error would escape before any command-level handler exists.
 
 **`formatting.py`** — one interface, two renderers (NF3).
 
@@ -370,9 +385,10 @@ sequenceDiagram
     participant C as SquadClient
     participant CK as Checkpoint
     U->>CLI: move-bulk --to 3 --ids-file ids.txt
-    CLI->>C: refresh(); LockManager.ensure()
+    CLI->>C: roster()
     CLI->>CLI: MovePlanner.plan() -> print dry-run
     U-->>CLI: confirm (or --yes)
+    CLI->>C: LockManager.ensure()
     CLI->>BM: run(plan)
     BM->>CK: load() -> done
     BM->>C: move_many(ids, 3, skip=done, on_progress=_progress)
@@ -381,9 +397,9 @@ sequenceDiagram
         alt AuthError / ThrottledError (batch-fatal)
             C-->>BM: raise
             BM-->>CLI: bubble (checkpoint NOT cleared)
-            CLI-->>U: "session expired — paste fresh cookie" / "rate limited — resume later"
-            U-->>CLI: new cookie
-            CLI->>C: rebuild session; re-run (done set preserved)
+            CLI-->>U: message + checkpoint path; exit 3 (auth) / 5 (throttle)
+            U-->>CLI: fresh cookie, re-run the SAME command
+            CLI->>C: new session; checkpoint replays as skip= (done set preserved)
         else outcome (incl. TransportError)
             C->>BM: _progress(outcome, i, total)
             BM->>CK: record(id) if ok
@@ -395,9 +411,21 @@ sequenceDiagram
     CLI->>U: results table + Lock: LOCKED (locked by this run)
 ```
 
-### 4.3 Match & cookie resolution (F0/NF1)
+**Session expiry is resume-by-re-run, not resume-in-process (NF2).** `AuthError` is batch-fatal (§3.6): the CLI prints the checkpoint path and exits `3` rather than prompting for a cookie inside the running loop. NF2 asked for a mid-run pause-and-prompt; this is the deliberate substitute, because the checkpoint already makes re-running the identical command continue from where it stopped, and a pause holds a lock and a half-finished batch open for as long as the operator takes to fetch a new cookie. The user-visible cost is retyping one command; the guarantee — no shooter moved twice, none skipped — is the same.
 
-`resolve_match`: `--match` → `config.default_match` → error "no match; pass --match or run `config set-default`". `parse_match` accepts `test-reverse-engineer` or the full squadding URL. `resolve_cookie`: `--cookie` (value or `@file`) → `PRACTISCORE_COOKIE` env → config → interactive prompt (hidden input). Cookie is never written to logs, audit, or checkpoint.
+### 4.3 Removal under an ambiguous status (§3.6)
+
+`removeshooter` has no trustworthy status: a `3xx` is success, `fetch` masks it as an opaque redirect, and a *successful* removal has been observed reported as `503`. The client therefore:
+
+1. posts with `allow_redirects=False, retry_throttle=False` — never replaying the mutation on `503`;
+2. treats any `3xx` as success (a `3xx` to `/login` is already `SessionExpiredError`, NF2);
+3. on `503`, **re-reads the page** and lets server state decide: slot now empty ⇒ success, still occupied ⇒ `ServerError`. An out-of-range position that the page never renders is absent from the snapshot, which is the only post-condition available on the §6.8 hidden-overflow cleanup path — absence counts as removed.
+
+This is the one place the client re-reads to confirm a write (spec §4 invariant 5); everywhere else the claim-plus-TTL model of §4.1 applies.
+
+### 4.4 Match & cookie resolution (F0/NF1)
+
+`resolve_match`: `--match` → `config.default_match` → error "no match; pass --match or run `config set-default`". `parse_match` accepts `test-reverse-engineer` or the full squadding URL. `resolve_cookie`: `--cookie` (value or `@file`) → `PRACTISCORE_COOKIE` env → config → interactive prompt (hidden input). Cookie is never written to logs, audit, or checkpoint. An unreadable `@file` or a malformed `config.toml` raises `ConfigError` → exit `2` (§3.7).
 
 ---
 
@@ -405,7 +433,11 @@ sequenceDiagram
 
 Invocation (v1): `python -m practiscore_squads <global-opts> <command> <args>` (a `practiscore-squads` console-script alias is defined in `pyproject.toml`).
 
-Exit codes: `0` success · `1` runtime error (network, parse) · `2` usage error (click) · `3` auth/session (bad or expired cookie, unresolved) · `4` partial failure (`move` returned `taken`/blocked, or a bulk run completed with ≥1 move failed) · `5` throttled — `move-bulk` stopped on a batch-fatal `ThrottledError` (§3.6); partial and resumable from the checkpoint · `130` user aborted at confirm.
+Exit codes: `0` success · `1` runtime error (network, parse) · `2` usage error — click's own, plus everything the operator can get wrong on disk or on the command line: no match selected, a URL that isn't a squadding URL, a malformed `config.toml`, an unreadable `@cookie` file, a non-integer shooter ID in `--ids`/`--ids-file` · `3` auth/session (bad or expired cookie, unresolved) · `4` partial failure (`move` returned `taken`/blocked, or a bulk run completed with ≥1 move failed) · `5` throttled — `move-bulk` stopped on a batch-fatal `ThrottledError` (§3.6); partial and resumable from the checkpoint · `130` user aborted at confirm.
+
+**No operator-input mistake exits as a traceback.** Every one of the `2` cases above is mapped explicitly — either by `error_boundary()` (`NoDefaultMatchError`, `InvalidMatchError`, `ConfigError`) or at the parse site (`--ids` reports the offending token, `--ids-file` reports `path:line`).
+
+**stdout vs stderr.** stdout carries the payload only — the rich tables, or under `--json` nothing but complete JSON documents. Diagnostics, the confirm prompt, the progress bar, and the trailing `Audit: <path>` line all go to stderr, so `--json` output stays machine-parseable while still reading normally in a terminal.
 
 ### 5.1 `config set-default`
 
@@ -427,6 +459,7 @@ practiscore-squads --json squads
 
 - Loads the bootstrap, prints one row per squad: **displayed number**, name, occupied/total, free count.
 - `--json`: `[{ "squad_no", "name", "capacity", "occupied", "free" }]`.
+- `free` counts **usable** slots — it is `Slot.free`, so reserved and disabled slots (§2.4) are excluded, not just occupied ones. Consequently `occupied + free < capacity` on any squad that has them. This is deliberate: `free` must mean the same thing here as it does to `free_slots()` and `move()`, or the table would advertise room that a bulk move then refuses as "squad full".
 - Read-only; does **not** lock.
 
 Sample table:
@@ -468,7 +501,9 @@ practiscore-squads --json move 9808574 --to 3 --dry-run
 ```
 
 - Moves one shooter (by ID) to a displayed squad number; `--position` optional (default first free slot).
-- **Locks** the match if unlocked (NF7), prints a **dry-run** line and asks to confirm (NF5) unless `--yes`. `--dry-run` (D5) prints the plan and exits `0` without executing — same as `move-bulk --dry-run`, and works with `--json`.
+- Prints a **dry-run** line and asks to confirm (NF5) unless `--yes`, then **locks** the match if unlocked (NF7) and executes. `--dry-run` (D5) prints the plan and exits `0` without executing — same as `move-bulk --dry-run`, and works with `--json`.
+- **A dry run and a declined confirm both leave the lock exactly as found** and report the state they saw (`Lock: UNLOCKED (unchanged — nothing was executed)`). Locking before the prompt would have meant "no" still changed the match.
+- **Audits the attempt** (NF8), success or failure, to the same file `move-bulk` uses; the path is echoed to stderr.
 - On success prints the outcome and the lock-status line.
 - **Exit codes (D4):** `0` for `moved`/`added`/`already there`; `4` for `taken` or `blocked: squad full` — so `move … && echo ok` only reports success when a shooter actually ended up in the target squad. A hard fault (`AuthError`, `ServerError`, etc.) still exits per the codes in §5.
 
@@ -481,11 +516,11 @@ practiscore-squads move-bulk --to 3 --ids-file squad3.txt --yes
 practiscore-squads --json move-bulk --to 3 --ids-file squad3.txt --dry-run
 ```
 
-- `--ids a,b,c` or `--ids-file <path>` (one ID per line, `#` comments allowed). Exactly one required.
-- Flow: refresh → **lock if needed** → **plan** → print dry-run (count of moves/no-ops/blocked) → confirm (or `--yes`) → execute with a **progress bar** → **checkpoint** each success → **audit** every attempt → print a results summary + lock status.
+- `--ids a,b,c` or `--ids-file <path>` (one ID per line, `#` comments allowed). Exactly one required. A non-integer entry is a usage error (`2`) naming the token, or `path:line` for a file.
+- Flow: refresh → **plan** → print dry-run (count of moves/no-ops/blocked) → confirm (or `--yes`) → **lock if needed** → execute with a **progress bar** → **checkpoint** each success → **audit** every attempt → print a results summary + lock status.
 - **Resumable:** re-running the same `--to`/ids after an interruption skips already-done shooters (NF6). `--fresh` ignores/clears any existing checkpoint.
 - **Continue-and-report:** finishes all it can; prints a table of failures with reasons (NF5). Exit code `4` if any failed.
-- **Session expiry:** pauses and prompts for a fresh cookie mid-run, then resumes (NF2).
+- **Session expiry (NF2):** the run stops at the first `AuthError`, leaves the checkpoint intact, prints its path, and exits `3`. Fetch a fresh cookie and **re-run the same command** — it continues from the checkpoint (§4.2). It does not prompt for a cookie inside the running loop.
 - **Throttled abort (D3):** a `ThrottledError` is batch-fatal (§3.6) and stops the run; exit code `5` — the checkpoint is left intact, so the same command resumes where it stopped once rate limiting clears.
 
 Results summary:
@@ -493,7 +528,7 @@ Results summary:
 ```
 Moved 2  •  Already there 0  •  Blocked/taken 0  •  Failed 0
 Lock: LOCKED (locked by this run)
-Audit: ~/.practiscore-squads/audit/test-reverse-engineer.jsonl
+Audit: ~/.practiscore-squads/audit/test-reverse-engineer.jsonl     <- stderr (§5)
 ```
 
 ---
@@ -589,58 +624,49 @@ Loaded only when `slug`+`target_squad`+`notify` match the current run; deleted o
 
 ## 10. Backlog
 
-**Status:** steps 1–3 of §9 are done — `models`, `errors`, `pacing`, `http`, `parsing`, `client` are implemented with 89 passing tests. Steps 4–8 are unbuilt: `planner`, `bulk`, `lock`, `checkpoint`, `audit`, `config`, `formatting`, and the whole `cli/` package exist only as designs in §3.6/§3.7.
+**Status:** all eight steps of §9 are built. `models`, `errors`, `pacing`, `http`, `parsing`, `client`, `planner`, `checkpoint`, `audit`, `bulk`, `lock`, `config`, `formatting`, the `cli/` package, and `README.md` are implemented, with **194 passing tests** (plus 3 opt-in `sandbox` tests, deselected by default) and a clean `ruff check src/`. What follows is what is left, not what was planned.
 
-Each task below is self-contained: it names its own files and its own definition of done, and can be picked up without any other task being finished first. Where a genuine ordering constraint exists it is stated as **Needs:**; everything without that line is unblocked today.
+Each task below is self-contained: it names its own files and its own definition of done. Where a genuine ordering constraint exists it is stated as **Needs:**.
 
-### 10.1 Documentation alignment
+### 10.1 Open
 
-- [ ] **D1 — Replace the `HttpClient` signature block with prose.** §3.3's code block has drifted from `http.py` (it shows `get(path, *, params, expect_json)` and `csrf=True`; the code has `get(path, *, headers)` and `csrf: str | None` carrying the token). Describe the responsibilities in prose so there is no second signature to keep in sync. *Done when:* §3.3 contains no Python signature block and the surrounding rules still cover headers, CSRF, retry, auth detection, and redirects.
-- [ ] **D2 — Update §4.1 for the claim-plus-TTL model.** The pseudocode still says `verify via refresh` and `refresh()` after each committed write. The implementation marks the target slot `claimed` locally and only re-scrapes when the snapshot exceeds `SNAPSHOT_TTL`. *Done when:* §4.1 describes local claiming, the TTL trigger, and the fact that a refresh discards claims because server state outranks local bookkeeping.
-- [ ] **D3 — Add exit code `5` for a throttle-aborted run.** §5's exit-code list has no entry for a bulk run that stops on `ThrottledError`, which is now batch-fatal (§3.6). *Done when:* `5` is defined as "throttled — partial, resumable from checkpoint" in §5 and referenced from §5.5.
-- [ ] **D4 — Specify `move` exit codes.** §5.4 currently says only that "a real fault exits non-zero", which leaves a `taken` result exiting `0` — so `move … && echo ok` reports success when nothing moved. *Done when:* §5.4 states `4` for `taken`/`blocked` and `0` for `already there`.
-- [ ] **D5 — Add `--dry-run` to `move`.** `move-bulk` has one; `move` has only an interactive confirm. *Done when:* §5.4 shows an example and §6.2 has the row.
-- [ ] **D6 — Document the `squad_members()` correlation limits.** It matches roster IDs to snapshot occupants **by name**, so same-named shooters mis-attribute; and a slot filled by this process is non-free but still nameless until the next refresh, so `free_slots()` sees a write that `squad_members()` does not. *Done when:* §3.5 states both limits.
-
-### 10.2 Core library
-
-- [ ] **C1 — Test the TTL staleness refresh.** `SquadClient._refresh_if_stale()` and `SNAPSHOT_TTL` shipped without a test; nothing pins that an expired snapshot re-scrapes or that a fresh one does not. *Done when:* tests cover both directions (construct with `snapshot_ttl=0` to force, and the default to suppress) and assert the bootstrap request count.
-- [ ] **C2 — Prove the UTF-8 guard actually guards.** `test_body_without_charset_is_decoded_as_utf8` passes today, but it has not been shown to fail with `resp.encoding = "utf-8"` removed from `http.py::_send` — an assertion that passes either way is worthless. *Done when:* the line has been temporarily removed, the test observed failing, and the line restored.
-- [ ] **C3 — Reject malformed match URLs.** `_parse_match_slug` passes non-matching input through verbatim, so `https://practiscore.com/my-match` (no `/squadding`) becomes a slug literally equal to that URL, producing a nonsense request path. *Done when:* URL-shaped input that does not match the squadding pattern raises, with a test.
 - [ ] **C4 — Verify the `LIKE` escaping assumption.** `search(literal=True)` escapes `%`/`_` with a backslash, but spec §3.2's verification log never confirmed the backend honours `\` escapes — if it does not, literal searches for names containing `_` silently return the wrong rows. *Done when:* the behaviour is checked against the sandbox and either confirmed in `spec.md` or the escaping strategy is corrected. **Needs:** a sandbox session (§8).
-- [ ] **C5 — Preserve rotated session cookies.** `HttpClient.from_cookie` sets `Cookie` as a session header, which suppresses the cookie jar, so any `Set-Cookie` the server sends is silently discarded. Harmless while Laravel does not rotate the session mid-run; breaks the run if it starts to. *Done when:* the pasted header is parsed into `session.cookies` instead, with a test that a server-set cookie survives to the next request.
+- [ ] **B1 — Reflect `--position` in the `move` preview.** `move` plans via `MovePlanner.plan([id], to_squad)`, which ignores `--position` and assumes the first free slot; the run then executes against the requested position. With an occupied `--position` the preview says `move` and the result is `taken`. *Done when:* the plan for an explicit `--position` classifies against that slot, with a `CliRunner` test that the preview and the outcome agree.
+- [ ] **B2 — Honour `@file` at the cookie prompt.** `resolve_cookie` runs `_read_cookie_value` on the flag, env, and config paths but returns the interactive prompt's value verbatim, so typing `@cookie.txt` at the prompt is taken as a literal cookie. *Done when:* the prompt result goes through the same reader, with a test.
+- [ ] **B3 — `TableFormatter.shooters` ignores its `squad_no` argument.** The filtering happens in `commands.py` before the call, so the parameter is dead weight in the `Formatter` protocol. *Done when:* either the renderer uses it (e.g. a "Squad N" caption) or it is dropped from the protocol and both implementations.
+- [ ] **B4 — `toggle_lock()` has no 419 refresh-and-retry.** `_check_and_save` re-`refresh()`es and retries once on a 419 (§3.3); the lock toggle does not, so an expired CSRF token during a long run surfaces as `UnexpectedResponseError` instead of recovering. *Done when:* `toggle_lock` retries once on 419, with a test.
 
-### 10.3 Orchestration layer (§3.6)
+### 10.2 Done
 
-- [ ] **O1 — `checkpoint.py`.** JSON store per §3.6/§7; `load()` honours the slug+target+notify guard, `record()` appends, `clear()` deletes. Pure filesystem, no network. *Done when:* unit-tested against a `tmp_path`, including the guard rejecting a mismatched run.
-- [ ] **O2 — `audit.py`.** Append-only JSONL/CSV writer per §3.6/§7. Emails included by owner choice (NF8), file kept local, `chmod 600` on POSIX. *Done when:* unit-tested for both formats and for the permission bits.
-- [ ] **O3 — `planner.py`.** `MovePlanner.plan()` classifies each shooter as move/add/noop/blocked without mutating (§3.6). *Done when:* unit-tested over a fixture snapshot covering all four classifications.
-- [ ] **O4 — `lock.py`.** `LockManager.ensure()` wrapping `client.ensure_locked()` into a `LockReport` (§3.6). Never auto-unlocks. *Done when:* unit-tested for both already-locked and locked-by-this-run.
-- [ ] **O5 — `bulk.py`.** `BulkMover` as the thin wrapper specified in §3.6 — checkpoint and audit layered onto `client.move_many` via `on_progress`, nothing else. *Done when:* tested that a batch-fatal raise leaves the checkpoint intact and a clean finish clears it. **Needs:** O1, O2.
+Kept as a record of what the definitions of done were measured against.
 
-### 10.4 CLI layer (§3.7, §5, §6)
+| Task | Outcome |
+|---|---|
+| **D1** — `HttpClient` signature block → prose | §3.3 is prose; no second signature to keep in sync. |
+| **D2** — §4.1 claim-plus-TTL | §4.1 documents local claiming, the `SNAPSHOT_TTL` trigger, and that a refresh discards claims. |
+| **D3** — exit code `5` | Defined in §5, referenced from §5.5. |
+| **D4** — `move` exit codes | §5.4: `4` for `taken`/blocked, `0` for `already there`. |
+| **D5** — `--dry-run` on `move` | §5.4 example + §6.2 row. |
+| **D6** — `squad_members()` correlation limits | Both limits stated in §3.5. |
+| **C1** — TTL staleness test | Covered both directions (`snapshot_ttl=0` forces, default suppresses), asserting the bootstrap request count. |
+| **C2** — prove the UTF-8 guard guards | Mutation-tested: with `resp.encoding = "utf-8"` removed from `http.py::_send`, `test_body_without_charset_is_decoded_as_utf8` fails on mojibake (`BrzÄczyszczykiewicz`); line restored. |
+| **C3** — reject malformed match URLs | `parse_match_slug` raises `InvalidMatchError` on URL-shaped input that is not a squadding URL. |
+| **C5** — preserve rotated session cookies | The pasted header is parsed into `session.cookies` with an explicit domain, so a `Set-Cookie` replaces rather than duplicates. |
+| **O1–O5** | `checkpoint`, `audit`, `planner`, `lock`, `bulk` all built and unit-tested per §3.6. |
+| **U1–U5** | `config`, `formatting`, `cli/main`, `cli/commands`, `__main__` all built; `CliRunner` covers option parsing, dry-run/confirm gating, `--json` shape, and every exit code in §5. |
+| **P1** — `py.typed` ships | Verified by inspecting a built wheel: contains `practiscore_squads/py.typed`. |
+| **P2** — sandbox suite | 3 opt-in `sandbox`-marked read tests against `test-reverse-engineer`. |
+| **P3** — README matches the CLI | README documents the shipped commands and drops the "not yet built" caveat. |
 
-- [ ] **U1 — `config.py`.** TOML load/save plus `resolve_match`, `parse_match`, `resolve_cookie` with the precedence chains in §4.3. *Done when:* unit-tested for each precedence chain including the "no match" error.
-- [ ] **U2 — `formatting.py`.** `TableFormatter` and `JsonFormatter` behind one Protocol (§3.7). Email omitted in both (NF9). *Done when:* tested that no renderer emits an email and that `--json` shapes match §5.2–§5.5.
-- [ ] **U3 — `cli/main.py`.** click group, the §6.1 global options, and a lazy `SquadClient` factory so read commands do not build a session until needed. *Done when:* `--help` and `--version` work with no cookie present.
-- [ ] **U4 — `cli/commands.py`.** The five commands of §5. *Done when:* `CliRunner` covers option parsing, dry-run/confirm gating, `--json` shape, and every exit code in §5. **Needs:** U1, U2, U3, and O1–O5 for `move-bulk`.
-- [ ] **U5 — `__main__.py`.** Two lines delegating to `cli.main:cli`, so the `python -m practiscore_squads` form advertised in §5 and `README.md` actually runs. *Done when:* `python -m practiscore_squads --help` exits 0. **Needs:** U3.
-
-### 10.5 Packaging & tooling
-
-- [ ] **P1 — Confirm `py.typed` ships.** The marker file exists but has not been verified to land in a built wheel under the hatchling config. *Done when:* a `python -m build` (or `hatch build`) wheel is inspected and contains `practiscore_squads/py.typed`.
-- [ ] **P2 — Sandbox integration suite.** The `sandbox` pytest marker is declared in `pyproject.toml` and deselected by default, but no test uses it. *Done when:* at least one opt-in test exercises a read path against `test-reverse-engineer` per the §8 discipline (restore initial layout, `email=0`/`send=no` throughout).
-- [ ] **P3 — Update `README.md` once the CLI exists.** It documents five commands and their flags as though shipped; today none of them run. *Done when:* README either matches the built CLI or carries a prominent "library core only — CLI in progress" note.
-
-### 10.6 Decided — no action
+### 10.3 Decided — no action
 
 Recorded so they are not re-litigated. Reopen only with a reason.
 
 | Item | Decision |
 |---|---|
-| `remove()` post-condition re-read (spec §3.6) | **Deferred** — `remove()` is not a v1 CLI command. |
+| `remove()` post-condition re-read (spec §3.6) | **Reopened and done** (§4.3). Reason: the `503`-on-success artifact cannot be told from a genuine failure by status alone, and the alternative — retrying — re-POSTs a mutation. A re-read was the only way to answer it correctly. |
+| NF2 mid-run cookie prompt | **Not implementing.** `AuthError` is batch-fatal and the checkpoint makes re-running the same command resume; a pause would hold a lock and a half-finished batch open indefinitely (§4.2). |
 | Audit CLI flags (`--audit-dir`, `--no-audit`) | **Not adding** — config file only. |
 | Response bodies in exception messages (NF9) | **Leaving as-is.** Newer errors already omit bodies; older ones interpolate them. |
 | Unused exception classes | **Deleted** — `taken`/`same`/`move` are control flow, not faults. |
-| ~25 ruff errors under `tests/` | **Leaving as-is** — all ten test files share the flagged import convention. |
-| Empty `src/practiscore_squads/cli/` | **Keeping** as the placeholder for U3/U4. |
+| 30 ruff errors under `tests/` | **Leaving as-is** — all flagged in `tests/` only (shared import convention); `ruff check src/` is clean. |

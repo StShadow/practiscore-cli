@@ -27,3 +27,21 @@ def test_ensure_reports_already_locked(make_client):
     report = LockManager().ensure(c)
     assert report.final is LockState.LOCKED
     assert report.locked_by_this_run is False
+
+
+def test_report_does_not_toggle_the_lock(make_client):
+    """`--dry-run` is documented as printing the plan without executing; toggling
+    the lock is a real mutation the tool never undoes, so report() must not."""
+    c, rsps = make_client(locked=False)
+    _add_lock(rsps)
+    report = LockManager().report(c)
+    assert report.final is LockState.UNLOCKED
+    assert report.locked_by_this_run is False
+    assert not any("/lock" in call.request.url for call in rsps.calls)
+
+
+def test_report_passes_through_an_existing_lock(make_client):
+    c, rsps = make_client(locked=True)
+    report = LockManager().report(c)
+    assert report.final is LockState.LOCKED
+    assert report.locked_by_this_run is False

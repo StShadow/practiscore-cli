@@ -311,9 +311,27 @@ class SquadClient:
             "/squads/removeshooter",
             data={"_token": self.snapshot.csrf, "info": slot.as_spot(), "page": page},
             allow_redirects=False,
+            # A 503 here is ambiguous, not transient (§3.6) — resolved below by
+            # re-reading, never by re-POSTing the removal.
+            retry_throttle=False,
         )
-        # §3.6: status is unreliable behind Cloudflare, so a 3xx is the success signal
-        # (http.post() has already turned a 3xx-to-/login into SessionExpiredError).
-        # Anything else means nothing was actually removed.
-        if not (300 <= parsed.status < 400):
-            raise ServerError(f"removeshooter failed with status {parsed.status}")
+        # §3.6: a 3xx is the success signal (http.post() has already turned a
+        # 3xx-to-/login into SessionExpiredError).
+        if 300 <= parsed.status < 400:
+            return
+        if parsed.status == 503:
+            # The one status the spec warns about: a *successful* removal was observed
+            # reported as 503 by the edge while `fetch` saw the real 3xx. The status
+            # can't distinguish that artifact from a genuine failure, so ask the server
+            # what actually happened (spec §4 invariant 5).
+            self.refresh()
+            after = self.snapshot.slot(squad_no, position)
+            # `None` == an out-of-range position that the page never renders — the
+            # hidden-overflow cleanup path (§6.8/A16), where absence is all we can see.
+            if after is None or after.occupant is None:
+                return
+            raise ServerError(
+                f"removeshooter returned 503 and squad {squad_no} position {position} "
+                "is still occupied — the removal did not take effect"
+            )
+        raise ServerError(f"removeshooter failed with status {parsed.status}")

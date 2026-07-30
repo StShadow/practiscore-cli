@@ -12,7 +12,7 @@ from practiscore_squads.models import LockState, MoveOutcome, Shooter
 from practiscore_squads.parsing import BootstrapParser
 from practiscore_squads.planner import ADD, MOVE, MovePlan, NOOP, PlannedMove
 
-from tests._data import ANATOLI, GRZEGORZ, SLUG, build_bootstrap
+from tests._data import ANATOLI, GRZEGORZ, SLUG, SQUAD1, build_bootstrap, build_squad
 
 SHOOTER_WITH_EMAIL = Shooter(id=GRZEGORZ, name="Grzegorz Brzęczyszczykiewicz",
                               email="grzegorz@example.invalid", division="Production", klass=None)
@@ -45,6 +45,24 @@ def test_squads_json_shape():
     assert {r["squad_no"] for r in rows} == {1, 2, 3}
     row1 = next(r for r in rows if r["squad_no"] == 1)
     assert row1 == {"squad_no": 1, "name": "Squad 1", "capacity": 5, "occupied": 1, "free": 4}
+
+
+def test_squads_free_count_excludes_reserved_and_disabled_slots():
+    """`free` must agree with `Slot.free` / `SquadClient.free_slots()`. Deriving it
+    as `capacity - occupied` counted reserved and disabled slots as available and
+    invited a bulk move that `move()` then refused as "squad full"."""
+    html = build_bootstrap(extra_squads="")
+    html = html.replace(
+        build_squad(SQUAD1, {1: ("Grzegorz Brzęczyszczykiewicz ", "Production")}),
+        build_squad(SQUAD1, {1: ("Grzegorz Brzęczyszczykiewicz ", "Production")},
+                    reserved={2}, disabled={3}),
+    )
+    snapshot = BootstrapParser().parse(html, SLUG)
+    row1 = next(r for r in json.loads(_json_output(lambda f: f.squads(snapshot)))
+                if r["squad_no"] == 1)
+    assert row1["capacity"] == 5
+    assert row1["occupied"] == 1
+    assert row1["free"] == 2  # positions 4 and 5 only — not 2 (reserved) or 3 (disabled)
 
 
 def test_squads_table_contains_expected_values():
@@ -152,3 +170,13 @@ def test_lock_table_mentions_already_locked():
     report = LockReport(final=LockState.LOCKED, locked_by_this_run=False)
     out = _table_output(lambda f: f.lock(report))
     assert "already locked" in out
+
+
+def test_lock_table_does_not_claim_locked_when_unlocked():
+    """LockManager.report() (dry run) can hand back UNLOCKED. The old suffix logic
+    printed "UNLOCKED (already locked)" — self-contradictory, and it read as though
+    the run had left the match protected when it had not."""
+    report = LockReport(final=LockState.UNLOCKED, locked_by_this_run=False)
+    out = _table_output(lambda f: f.lock(report))
+    assert "UNLOCKED" in out
+    assert "already locked" not in out

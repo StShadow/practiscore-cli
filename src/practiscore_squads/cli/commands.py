@@ -79,36 +79,56 @@ def move_cmd(obj, shooter_id, to_squad, position, yes, notify, dry_run):
         notify = obj.notify or notify
 
         client = obj.build_client()
-        lock_report = LockManager().ensure(client)  # NF7: lock before mutating
+        # Fetched once and threaded through both the plan and the audit log — the
+        # audit needs name+email per NF8, and the planner needs the same rows.
+        roster = client.roster()
 
-        plan = MovePlanner(client).plan([shooter_id], to_squad)
+        plan = MovePlanner(client).plan([shooter_id], to_squad, roster=roster)
         obj.formatter.plan(plan)
 
         if dry_run:
-            obj.formatter.lock(lock_report)
+            # Read-only report: a dry run must not toggle the lock (see LockManager.report).
+            obj.formatter.lock(LockManager().report(client))
             return
 
         if not yes:
             confirm_or_abort(f"Move shooter {shooter_id} to Squad {to_squad}?")
 
+        lock_report = LockManager().ensure(client)  # NF7: lock before mutating
+        audit = _build_audit(obj, client, roster, notify)
+
         outcome = client.move(shooter_id, to_squad, position=position, notify=notify)
+        audit.write(outcome)  # NF8: *every* attempted move, single ones included
         obj.formatter.outcomes([outcome])
         obj.formatter.lock(lock_report)
+        _echo_audit_path(audit)
 
         if not outcome.ok:
             sys.exit(4)  # D4: taken/blocked
 
 
 # -------------------------------- move-bulk ------------------------------------ #
+def _to_id(token: str, source: str) -> int:
+    """Shooter IDs come from the operator's clipboard or a hand-edited file, so a
+    stray word is ordinary user error — it exits 2 with the offending token rather
+    than as a raw ValueError traceback."""
+    try:
+        return int(token)
+    except ValueError:
+        _fail_usage(f"{source}: {token!r} is not a shooter ID (expected an integer)")
+        raise  # unreachable; _fail_usage raises SystemExit
+
+
 def _parse_ids(ids: str | None, ids_file: str | None) -> list[int]:
     if ids:
-        return [int(part.strip()) for part in ids.split(",") if part.strip()]
-    text = Path(ids_file).read_text(encoding="utf-8")
+        return [_to_id(part.strip(), "--ids") for part in ids.split(",") if part.strip()]
+    path = Path(ids_file)
+    text = path.read_text(encoding="utf-8")
     out: list[int] = []
-    for line in text.splitlines():
+    for lineno, line in enumerate(text.splitlines(), start=1):
         line = line.split("#", 1)[0].strip()
         if line:
-            out.append(int(line))
+            out.append(_to_id(line, f"{path}:{lineno}"))
     return out
 
 
@@ -140,23 +160,25 @@ def move_bulk_cmd(obj, to_squad, ids, ids_file, dry_run, fresh, yes, notify):
         notify = obj.notify or notify
 
         client = obj.build_client()
-        lock_report = LockManager().ensure(client)  # NF7: lock before mutating
+        roster = client.roster()  # one fetch, shared by the plan and the audit log
 
-        plan = MovePlanner(client).plan(shooter_ids, to_squad)
+        plan = MovePlanner(client).plan(shooter_ids, to_squad, roster=roster)
         obj.formatter.plan(plan)
 
         if dry_run:
-            obj.formatter.lock(lock_report)
+            # Read-only report: a dry run must not toggle the lock (see LockManager.report).
+            obj.formatter.lock(LockManager().report(client))
             return
 
         if not yes:
             confirm_or_abort(f"Move {len(plan.actionable())} shooter(s) to Squad {to_squad}?")
 
+        lock_report = LockManager().ensure(client)  # NF7: lock before mutating
+
         checkpoint = Checkpoint(client.slug, to_squad, notify)
         if fresh:
             checkpoint.clear()
-        audit = AuditLog(client.slug, client.roster(), notify=notify,
-                         dir=obj.config.audit_dir, fmt=obj.config.audit_format)
+        audit = _build_audit(obj, client, roster, notify)
 
         with Progress(disable=obj.quiet or obj.json_output) as progress:
             task_id = progress.add_task("Moving", total=len(plan.actionable()))
@@ -180,10 +202,23 @@ def move_bulk_cmd(obj, to_squad, ids, ids_file, dry_run, fresh, yes, notify):
 
         obj.formatter.outcomes(outcomes)
         obj.formatter.lock(lock_report)
-        click.echo(f"Audit: {audit.path}")
+        _echo_audit_path(audit)
 
         if any(not o.ok for o in outcomes):
             sys.exit(4)
+
+
+# --------------------------------- helpers ------------------------------------- #
+def _build_audit(obj, client, roster, notify: bool) -> AuditLog:
+    return AuditLog(client.slug, roster, notify=notify,
+                    dir=obj.config.audit_dir, fmt=obj.config.audit_format)
+
+
+def _echo_audit_path(audit: AuditLog) -> None:
+    """stderr, not stdout: under `--json` the stdout stream is the machine-readable
+    payload, and a bare `Audit: <path>` line appended to it made the output
+    unparseable. It still shows up in a terminal either way."""
+    click.echo(f"Audit: {audit.path}", err=True)
 
 
 def _fail_usage(message: str) -> None:

@@ -10,8 +10,17 @@ import responses
 from practiscore_squads.errors import NotAuthorizedError, ServerError, SessionExpiredError
 
 from tests._data import (
-    BASE, SLUG, SQUAD1, bodies_for, path_called, removeask_re, removeshooter_url,
+    BASE, SLUG, SQUAD1, bodies_for, bootstrap_url, build_bootstrap,
+    build_squad, path_called, removeask_re, removeshooter_url,
 )
+
+
+def build_bootstrap_with_squad1_empty() -> str:
+    """The page as it looks *after* Grzegorz has been removed from Squad 1 pos 1."""
+    return build_bootstrap().replace(
+        build_squad(SQUAD1, {1: ("Grzegorz Brzęczyszczykiewicz ", "Production")}),
+        build_squad(SQUAD1),
+    )
 
 
 def test_can_remove_true_on_ask(make_client):
@@ -72,3 +81,50 @@ def test_remove_raises_on_server_error(make_client):
              json={"message": "Server Error"}, status=500)
     with pytest.raises(ServerError):
         c.remove(1, 1)
+
+
+# ------------------- the ambiguous 503 of §3.6 ---------------------------- #
+def test_remove_503_is_never_retried(make_client):
+    """The removal is a mutation and 503 has been seen ON SUCCESS (§3.6), so the
+    generic throttle retry must not replay the POST three more times."""
+    c, rsps = make_client()
+    rsps.add(responses.GET, removeask_re(), body="ask", content_type="text/html")
+    rsps.add(responses.POST, removeshooter_url(), status=503, body="")
+    rsps.add(responses.GET, bootstrap_url(),
+             body=build_bootstrap_with_squad1_empty(), content_type="text/html")
+    c.remove(1, 1)
+    assert len([x for x in rsps.calls if "/squads/removeshooter" in x.request.url]) == 1
+
+
+def test_remove_503_with_vacated_slot_is_success(make_client):
+    """The monitoring artifact: 503 reported, removal actually done. The re-read
+    shows the slot empty, so it is a success, not a ThrottledError."""
+    c, rsps = make_client()
+    rsps.add(responses.GET, removeask_re(), body="ask", content_type="text/html")
+    rsps.add(responses.POST, removeshooter_url(), status=503, body="")
+    rsps.add(responses.GET, bootstrap_url(),
+             body=build_bootstrap_with_squad1_empty(), content_type="text/html")
+    c.remove(1, 1)  # must not raise
+    assert c.snapshot.slot(1, 1).occupant is None
+
+
+def test_remove_503_with_occupied_slot_raises(make_client):
+    """A genuine failure that happens to answer 503: the occupant is still there
+    on re-read, so it must NOT be reported as a completed removal."""
+    c, rsps = make_client()
+    rsps.add(responses.GET, removeask_re(), body="ask", content_type="text/html")
+    rsps.add(responses.POST, removeshooter_url(), status=503, body="")
+    rsps.add(responses.GET, bootstrap_url(), body=build_bootstrap(), content_type="text/html")
+    with pytest.raises(ServerError):
+        c.remove(1, 1)
+
+
+def test_remove_503_on_unrendered_position_is_success(make_client):
+    """Out-of-range cleanup (§6.8/A16): the page never renders position 7, so
+    'absent from the snapshot' is the only post-condition available."""
+    c, rsps = make_client()
+    rsps.add(responses.GET, removeask_re(), body="ask", content_type="text/html")
+    rsps.add(responses.POST, removeshooter_url(), status=503, body="")
+    rsps.add(responses.GET, bootstrap_url(), body=build_bootstrap(), content_type="text/html")
+    c.remove(1, 7)  # must not raise
+    assert f"spot_{SQUAD1}_7_" in bodies_for(rsps, "/squads/removeshooter")[0]

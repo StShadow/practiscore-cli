@@ -14,7 +14,7 @@ from rich.console import Console
 from rich.table import Table
 
 from .lock import LockReport
-from .models import MatchSnapshot, MoveOutcome, Shooter
+from .models import LockState, MatchSnapshot, MoveOutcome, Shooter
 from .planner import MovePlan
 
 
@@ -43,13 +43,18 @@ def squad_dicts(snapshot: MatchSnapshot) -> list[dict]:
     rows = []
     for squad_no, slots in sorted(snapshot.by_squad().items()):
         occupied = sum(1 for s in slots if s.occupant is not None)
+        # `Slot.free`, not `capacity - occupied`: reserved and disabled slots are
+        # neither occupied nor usable, and counting them as free told the operator
+        # to plan a bulk move that `move()` would then refuse as "squad full".
+        # So `occupied + free < capacity` whenever a squad has reserved/disabled slots.
+        free = sum(1 for s in slots if s.free)
         capacity = len(slots)
         rows.append({
             "squad_no": squad_no,
             "name": f"Squad {squad_no}",
             "capacity": capacity,
             "occupied": occupied,
-            "free": capacity - occupied,
+            "free": free,
         })
     return rows
 
@@ -152,7 +157,14 @@ class TableFormatter:
                 self.console.print(f"  #{o.shooter_id}: {o.detail}")
 
     def lock(self, report: LockReport) -> None:
-        suffix = "(locked by this run)" if report.locked_by_this_run else "(already locked)"
+        if report.locked_by_this_run:
+            suffix = "(locked by this run)"
+        elif report.final is LockState.LOCKED:
+            suffix = "(already locked)"
+        else:
+            # Only reachable from LockManager.report() — i.e. a dry run, which
+            # deliberately leaves the lock alone.
+            suffix = "(unchanged — nothing was executed)"
         self.console.print(f"Lock: {report.final.value.upper()} {suffix}")
 
 

@@ -305,3 +305,156 @@ def test_move_bulk_declining_confirm_exits_130():
         input="n\n",
     )
     assert result.exit_code == 130
+
+
+# ----------------------- audit, dry-run purity, --json purity ---------------- #
+def _audit_lines(home: Path) -> list[dict]:
+    path = home / ".practiscore-squads" / "audit" / f"{SLUG}.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+
+@responses.activate
+def test_single_move_writes_an_audit_record(isolated_home):
+    """NF8 covers *every* attempted move, not just bulk ones — `move` used to
+    execute without ever constructing an AuditLog."""
+    _register_bootstrap_and_roster()
+    responses.add(responses.POST, f"{BASE}/matches/{SLUG}/lock",
+                  json={"success": True}, content_type="application/json")
+    responses.add(responses.POST, check_re(SQUAD3, GRZEGORZ),
+                  body='{"cmd":"added","num":3}', content_type="text/html")
+    result = _runner().invoke(
+        cli, ["--match", SLUG, "--cookie", COOKIE, "move", str(GRZEGORZ), "--to", "3", "--yes"]
+    )
+    assert result.exit_code == 0, result.output
+    records = _audit_lines(isolated_home)
+    assert len(records) == 1
+    assert records[0]["shooter_id"] == GRZEGORZ
+    assert records[0]["outcome"] == "added"
+    assert records[0]["email"] == "grzegorz@example.invalid"  # NF8: audit is the one place
+
+
+@responses.activate
+def test_single_move_audits_a_failed_attempt_too(isolated_home):
+    _register_bootstrap_and_roster()
+    responses.add(responses.POST, f"{BASE}/matches/{SLUG}/lock",
+                  json={"success": True}, content_type="application/json")
+    result = _runner().invoke(
+        cli, ["--match", SLUG, "--cookie", COOKIE, "move", str(ANATOLI),
+              "--to", "1", "--position", "1", "--yes"]
+    )
+    assert result.exit_code == 4, result.output
+    records = _audit_lines(isolated_home)
+    assert len(records) == 1
+    assert records[0]["shooter_id"] == ANATOLI
+    assert "taken" in records[0]["outcome"]
+
+
+@responses.activate
+def test_move_dry_run_does_not_lock_the_match():
+    """A dry run is documented as executing nothing; the lock toggle is a real
+    mutation this tool never reverses, so it must stay off the dry-run path."""
+    _register_bootstrap_and_roster()
+    responses.add(responses.POST, f"{BASE}/matches/{SLUG}/lock",
+                  json={"success": True}, content_type="application/json")
+    result = _runner().invoke(
+        cli, ["--match", SLUG, "--cookie", COOKIE, "move", str(GRZEGORZ),
+              "--to", "3", "--dry-run"]
+    )
+    assert result.exit_code == 0, result.output
+    assert not any("/lock" in c.request.url for c in responses.calls)
+    assert "UNLOCKED" in result.output
+
+
+@responses.activate
+def test_move_bulk_dry_run_does_not_lock_the_match():
+    _register_bootstrap_and_roster()
+    responses.add(responses.POST, f"{BASE}/matches/{SLUG}/lock",
+                  json={"success": True}, content_type="application/json")
+    result = _runner().invoke(
+        cli, ["--match", SLUG, "--cookie", COOKIE, "move-bulk", "--to", "3",
+              "--ids", f"{GRZEGORZ},{ANATOLI}", "--dry-run"]
+    )
+    assert result.exit_code == 0, result.output
+    assert not any("/lock" in c.request.url for c in responses.calls)
+
+
+@responses.activate
+def test_declined_confirm_does_not_lock_the_match():
+    """Locking used to happen before the prompt, so answering "no" still left the
+    match locked for shooters."""
+    _register_bootstrap_and_roster()
+    responses.add(responses.POST, f"{BASE}/matches/{SLUG}/lock",
+                  json={"success": True}, content_type="application/json")
+    result = _runner().invoke(
+        cli, ["--match", SLUG, "--cookie", COOKIE, "move", str(GRZEGORZ), "--to", "3"],
+        input="n\n",
+    )
+    assert result.exit_code == 130
+    assert not any("/lock" in c.request.url for c in responses.calls)
+
+
+@responses.activate
+def test_move_bulk_json_stdout_is_pure_json(isolated_home):
+    """The `Audit: <path>` line belongs on stderr — on stdout it made `--json`
+    output unparseable for the machine consumer the flag exists for."""
+    _register_bootstrap_and_roster()
+    responses.add(responses.POST, f"{BASE}/matches/{SLUG}/lock",
+                  json={"success": True}, content_type="application/json")
+    responses.add(responses.POST, check_re(SQUAD3, GRZEGORZ),
+                  body='{"cmd":"added","num":3}', content_type="text/html")
+    responses.add(responses.POST, check_re(SQUAD3, ANATOLI),
+                  body='{"cmd":"added","num":3}', content_type="text/html")
+    result = _runner().invoke(
+        cli, ["--match", SLUG, "--cookie", COOKIE, "--json", "--quiet", "move-bulk",
+              "--to", "3", "--ids", f"{GRZEGORZ},{ANATOLI}", "--yes"]
+    )
+    assert result.exit_code == 0, result.output
+    docs = [json.loads(ln) for ln in result.stdout.splitlines() if ln.strip()]
+    assert len(docs) == 3  # plan, outcomes, lock
+    assert "Audit:" in result.stderr
+
+
+# ------------------------- bad operator input exits 2 ------------------------ #
+@responses.activate
+def test_non_integer_id_is_a_usage_error_not_a_traceback():
+    _register_bootstrap_and_roster()
+    result = _runner().invoke(
+        cli, ["--match", SLUG, "--cookie", COOKIE, "move-bulk", "--to", "3",
+              "--ids", f"{GRZEGORZ},oops", "--dry-run"]
+    )
+    assert result.exit_code == 2
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "oops" in result.stderr
+
+
+@responses.activate
+def test_non_integer_id_in_file_reports_the_line(tmp_path):
+    _register_bootstrap_and_roster()
+    ids_file = tmp_path / "ids.txt"
+    ids_file.write_text(f"{GRZEGORZ}\nnot-an-id\n", encoding="utf-8")
+    result = _runner().invoke(
+        cli, ["--match", SLUG, "--cookie", COOKIE, "move-bulk", "--to", "3",
+              "--ids-file", str(ids_file), "--dry-run"]
+    )
+    assert result.exit_code == 2
+    assert "not-an-id" in result.stderr
+    assert ":2" in result.stderr
+
+
+def test_malformed_config_file_is_a_usage_error(isolated_home):
+    cfg_dir = isolated_home / ".practiscore-squads"
+    cfg_dir.mkdir(parents=True, exist_ok=True)
+    (cfg_dir / "config.toml").write_text("this is not = = toml", encoding="utf-8")
+    result = _runner().invoke(cli, ["squads"])
+    assert result.exit_code == 2
+    assert "valid TOML" in result.stderr
+
+
+def test_missing_cookie_file_is_a_usage_error(isolated_home):
+    result = _runner().invoke(
+        cli, ["--match", SLUG, "--cookie", "@/nonexistent/cookie.txt", "squads"]
+    )
+    assert result.exit_code == 2
+    assert "cookie file" in result.stderr

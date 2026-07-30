@@ -111,7 +111,8 @@ class HttpClient:
         return f"{self.base}{path}"
 
     def _send(self, method: str, path: str, *, data=None, headers=None,
-              allow_redirects: bool = True, max_attempts: int = 4) -> requests.Response:
+              allow_redirects: bool = True, max_attempts: int = 4,
+              retry_throttle: bool = True) -> requests.Response:
         url = self._url(path)
         attempt = 0
         while True:
@@ -135,7 +136,7 @@ class HttpClient:
             # (RFC 2616 default); the site is UTF-8 throughout (NF11 — Cyrillic,
             # Polish diacritics), so force decoding accordingly.
             resp.encoding = "utf-8"
-            if resp.status_code in _THROTTLE_STATUSES:
+            if retry_throttle and resp.status_code in _THROTTLE_STATUSES:
                 if attempt < max_attempts:
                     self.pacer.penalize(attempt)
                     continue
@@ -151,11 +152,20 @@ class HttpClient:
         return _to_parsed(resp)
 
     def post(self, path: str, *, data: dict | None = None, csrf: str | None = None,
-             headers: dict | None = None, allow_redirects: bool = True) -> Parsed:
+             headers: dict | None = None, allow_redirects: bool = True,
+             retry_throttle: bool = True) -> Parsed:
+        """`retry_throttle=False` returns a 429/503 to the caller instead of retrying.
+
+        The default is right for `check`/`save`, whose replays are harmless (a repeat
+        lands on `same`/`moved`). It is wrong for `removeshooter`, where a 503 has been
+        observed *on a successful* removal (§3.6) — retrying there re-POSTs a mutation
+        against a status that never meant failure.
+        """
         hdrs = dict(headers or {})
         if csrf:
             hdrs["X-CSRF-TOKEN"] = csrf
-        resp = self._send("POST", path, data=data, headers=hdrs, allow_redirects=allow_redirects)
+        resp = self._send("POST", path, data=data, headers=hdrs,
+                          allow_redirects=allow_redirects, retry_throttle=retry_throttle)
         # Auth detection must run before the early-return below: with allow_redirects=False
         # a 3xx to /login (dead session) looks identical to a 3xx success redirect unless
         # we inspect it here (§3.6).

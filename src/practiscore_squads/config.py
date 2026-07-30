@@ -1,4 +1,4 @@
-"""Config load/save and match/cookie resolution (F0/NF1, implementation.md §3.7/§4.3).
+"""Config load/save and match/cookie resolution (F0/NF1, implementation.md §3.7/§4.4).
 
 TOML on disk (`tomllib` to read, `tomli-w` to write); match/cookie precedence
 chains are pure functions so the CLI layer can unit-test them without a
@@ -16,8 +16,17 @@ import tomli_w
 
 from .client import parse_match_slug as parse_match  # noqa: F401  (re-exported, §3.7 signature)
 
-__all__ = ["Config", "NoDefaultMatchError", "load", "save", "resolve_match", "parse_match",
-           "resolve_cookie"]
+__all__ = ["Config", "ConfigError", "NoDefaultMatchError", "load", "save", "resolve_match",
+           "parse_match", "resolve_cookie"]
+
+
+class ConfigError(ValueError):
+    """A config file or `@file` cookie exists but couldn't be read or parsed.
+
+    Distinct from a library fault: nothing is wrong with the API or the session, the
+    inputs on disk are bad. The CLI maps it to the usage exit code rather than letting
+    a raw `TOMLDecodeError`/`OSError` traceback reach the operator.
+    """
 
 
 class NoDefaultMatchError(ValueError):
@@ -50,8 +59,13 @@ def load(path: Path | None = None) -> Config:
     path = path if path is not None else default_config_path()
     if not path.exists():
         return Config()
-    with path.open("rb") as fh:
-        data = tomllib.load(fh)
+    try:
+        with path.open("rb") as fh:
+            data = tomllib.load(fh)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"{path} is not valid TOML: {exc}") from exc
+    except OSError as exc:
+        raise ConfigError(f"could not read {path}: {exc}") from exc
     return Config(
         default_match=data.get("default_match"),
         cookie=data.get("cookie"),
@@ -98,7 +112,11 @@ def resolve_match(cli_value: str | None, cfg: Config) -> str:
 def _read_cookie_value(value: str) -> str:
     """Supports the NF1 `@path` convention for pasting a cookie via a file."""
     if value.startswith("@"):
-        return Path(value[1:]).expanduser().read_text(encoding="utf-8").strip()
+        path = Path(value[1:]).expanduser()
+        try:
+            return path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            raise ConfigError(f"could not read cookie file {path}: {exc}") from exc
     return value
 
 
