@@ -9,10 +9,12 @@ import practiscore_squads.pacing as pacing_mod
 from practiscore_squads.errors import SessionExpiredError, ThrottledError
 
 from tests._data import (
-    ANATOLI, BASE, GRZEGORZ, SLUG, SQUAD3, check_re, called_urls, path_called, save_re,
+    ANATOLI, BASE, GRZEGORZ, SLUG, SQUAD3, bootstrap_url, build_bootstrap, build_squad, check_re,
+    called_urls, path_called, save_re,
 )
 
 THIRD = 9808999  # a third shooter, used to prove a batch stopped early
+FOURTH = 9808998
 
 
 def _added(rsps, shooter, num=3):
@@ -44,13 +46,49 @@ def test_move_many_continue_and_report_on_failure(make_client):
 
 
 def test_move_many_skips_checkpointed(make_client):
-    """NF6: `skip` (resume) means finished shooters are not re-requested."""
+    """NF6: `skip` (resume) means finished shooters are not re-requested, and the
+    remaining shooter is assigned whatever slot the live snapshot actually shows
+    free (here, position 1 — Squad 3 is genuinely empty in this fixture) rather
+    than a slot picked by its position in the original, pre-skip list."""
     c, rsps = make_client()
     _added(rsps, ANATOLI)
     outcomes = c.move_many([GRZEGORZ, ANATOLI], 3, skip={GRZEGORZ})
-    assert not path_called(rsps, f"/squads/check/squad_{SQUAD3}_1_")  # no request touching GRZEGORZ's move
     assert not any(str(GRZEGORZ) in c_.request.url for c_ in rsps.calls if "/squads/check/" in c_.request.url)
     assert {o.shooter_id for o in outcomes if o.ok} == {ANATOLI}
+    assert path_called(rsps, f"/squads/check/squad_{SQUAD3}_1_")
+
+
+def test_move_many_resume_after_partial_fill_does_not_falsely_block(make_client):
+    """Regression: a resumed run must assign slots by each remaining shooter's
+    position among the *outstanding* work, not by its position in the original
+    `shooter_ids` list.
+
+    Squad 3 has 3 of 5 slots already filled (as if an earlier partial run
+    already moved two of the four shooters below). Only GRZEGORZ/ANATOLI are
+    in `skip` — their target-squad occupancy is irrelevant to the bug; what
+    matters is that their *original indices* (0, 1) are lower than the 2
+    remaining free slots. The old original-index scheme indexed into the
+    (correctly shorter) `free` list using THIRD/FOURTH's original indices
+    (2, 3), which fell outside `free` and produced a false
+    "blocked: squad full" despite two slots being genuinely open.
+    """
+    c, rsps = make_client()
+    filled = build_bootstrap().replace(
+        build_squad(SQUAD3),
+        build_squad(SQUAD3, occupants={
+            1: ("Filler One", None), 2: ("Filler Two", None), 3: ("Filler Three", None),
+        }),
+    )
+    rsps.add(responses.GET, bootstrap_url(), body=filled, content_type="text/html")
+    c.refresh()
+
+    _added(rsps, THIRD)
+    _added(rsps, FOURTH)
+    outcomes = c.move_many([GRZEGORZ, ANATOLI, THIRD, FOURTH], 3, skip={GRZEGORZ, ANATOLI})
+
+    assert {o.shooter_id for o in outcomes} == {THIRD, FOURTH}
+    assert all(o.ok for o in outcomes), outcomes
+    assert all(o.detail == "added" for o in outcomes)
 
 
 def test_move_many_progress_callback(make_client):

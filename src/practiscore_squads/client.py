@@ -226,16 +226,21 @@ class SquadClient:
         squad_ids = self.snapshot.squad_ids()
         if squad_no not in squad_ids:
             raise SlotNotFoundError(f"squad {squad_no} not found")
-        # Slots are pre-assigned by each shooter's ORIGINAL index (not the post-skip
-        # index) so a resumed run targets the same physical slots a fresh run would —
-        # a skipped shooter's slot is never handed to someone else in the same batch.
+        # `free` is scraped from the live snapshot, so it already excludes whatever
+        # `skip` occupies (a resumed shooter's earlier write is server truth by the
+        # time this snapshot was fetched). Slots are therefore handed out by each
+        # `todo` item's own position among the *remaining* work — indexing by
+        # position in the original `shooter_ids` list instead would run out of
+        # range as soon as more shooters were done than slots remained, wrongly
+        # reporting the rest as "blocked: squad full" on every non-trivial resume.
         free = sorted((s for s in self.snapshot.by_squad()[squad_no] if s.free),
                       key=lambda s: s.position)
 
-        todo = [(i, sid) for i, sid in enumerate(shooter_ids) if sid not in skip]
+        todo = [sid for sid in shooter_ids if sid not in skip]
         total = len(todo)
         outcomes: list[MoveOutcome] = []
-        for done, (i, sid) in enumerate(todo, 1):
+        for i, sid in enumerate(todo):
+            done = i + 1
             try:
                 if i < len(free):
                     oc = self.move(sid, squad_no, position=free[i].position, notify=notify)
