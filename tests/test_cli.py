@@ -162,13 +162,36 @@ def test_move_taken_exits_4():
     _register_bootstrap_and_roster()
     responses.add(responses.POST, f"{BASE}/matches/{SLUG}/lock",
                   json={"success": True}, content_type="application/json")
-    # Grzegorz already occupies Squad 1 position 1 — moving him there again with
-    # an explicit occupied position must be refused without a network probe.
+    # Grzegorz already occupies Squad 1 position 1 — moving Anatoli onto that
+    # explicit occupied position must be refused without a network probe.
     result = _runner().invoke(
         cli, ["--match", SLUG, "--cookie", COOKIE, "move", str(ANATOLI),
               "--to", "1", "--position", "1", "--yes"]
     )
     assert result.exit_code == 4, result.output
+
+
+@responses.activate
+def test_move_position_preview_agrees_with_the_blocked_outcome():
+    """B1: before the fix, MovePlanner.plan() ignored `--position` entirely and
+    always previewed the first free slot, so this printed "(move)" and asked
+    the operator to confirm a move — then `client.move(position=1)`, which DOES
+    check the explicit slot's occupancy, came back "taken" and exited 4. The
+    preview must call it blocked *before* the confirm prompt, not just fail
+    silently the same way after it."""
+    _register_bootstrap_and_roster()
+    responses.add(responses.POST, f"{BASE}/matches/{SLUG}/lock",
+                  json={"success": True}, content_type="application/json")
+    result = _runner().invoke(
+        cli, ["--match", SLUG, "--cookie", COOKIE, "move", str(ANATOLI),
+              "--to", "1", "--position", "1", "--yes"]
+    )
+    assert result.exit_code == 4, result.output
+    assert "(move)" not in result.output
+    assert "blocked" in result.output
+    # No check/save POST at all: the plan must classify from the snapshot alone,
+    # same as move()'s own local free-check, not by probing the server (NF10).
+    assert not any("/squads/check/" in c.request.url for c in responses.calls)
 
 
 @responses.activate

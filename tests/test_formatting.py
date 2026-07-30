@@ -76,7 +76,7 @@ def test_squads_table_contains_expected_values():
 # -------------------------------- shooters() ------------------------------- #
 def test_shooters_json_shape():
     rows = [ShooterRow(SHOOTER_WITH_EMAIL, 1), ShooterRow(ANATOLI_SHOOTER, None)]
-    out = _json_output(lambda f: f.shooters(rows, None))
+    out = _json_output(lambda f: f.shooters(rows))
     data = json.loads(out)
     assert data == [
         {"id": GRZEGORZ, "name": "Grzegorz Brzęczyszczykiewicz", "division": "Production",
@@ -88,14 +88,14 @@ def test_shooters_json_shape():
 
 def test_shooters_json_never_includes_email():
     rows = [ShooterRow(SHOOTER_WITH_EMAIL, 1)]
-    out = _json_output(lambda f: f.shooters(rows, None))
+    out = _json_output(lambda f: f.shooters(rows))
     assert "example.invalid" not in out
     assert "email" not in out
 
 
 def test_shooters_table_never_includes_email():
     rows = [ShooterRow(SHOOTER_WITH_EMAIL, 1)]
-    out = _table_output(lambda f: f.shooters(rows, None))
+    out = _table_output(lambda f: f.shooters(rows))
     assert "example.invalid" not in out
     assert "Grzegorz" in out
 

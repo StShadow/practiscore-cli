@@ -33,7 +33,10 @@ class ShooterRow:
 
 class Formatter(Protocol):
     def squads(self, snapshot: MatchSnapshot) -> None: ...
-    def shooters(self, rows: list[ShooterRow], squad_no: int | None) -> None: ...
+    # No `squad_no` filter parameter here: the CLI already filters `rows` before
+    # calling (shooters_cmd), and each ShooterRow carries its own `squad_no`
+    # column — a second copy of the same number had nothing left to do (B3).
+    def shooters(self, rows: list[ShooterRow]) -> None: ...
     def plan(self, plan: MovePlan) -> None: ...
     def outcomes(self, outcomes: list[MoveOutcome]) -> None: ...
     def lock(self, report: LockReport) -> None: ...
@@ -123,7 +126,7 @@ class TableFormatter:
                           f"{row['occupied']}/{row['capacity']}", str(row["free"]))
         self.console.print(table)
 
-    def shooters(self, rows: list[ShooterRow], squad_no: int | None) -> None:
+    def shooters(self, rows: list[ShooterRow]) -> None:
         table = Table()
         table.add_column("ID")
         table.add_column("Name")
@@ -181,7 +184,7 @@ class JsonFormatter:
     def squads(self, snapshot: MatchSnapshot) -> None:
         self._dump(squad_dicts(snapshot))
 
-    def shooters(self, rows: list[ShooterRow], squad_no: int | None) -> None:
+    def shooters(self, rows: list[ShooterRow]) -> None:
         self._dump(shooter_dicts(rows))
 
     def plan(self, plan: MovePlan) -> None:

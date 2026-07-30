@@ -108,3 +108,22 @@ def test_resolve_cookie_reads_at_file(tmp_path):
     cfg = Config()
     got = resolve_cookie(f"@{cookie_file}", cfg, env={})
     assert got == "laravel_session=filedata"
+
+
+def test_resolve_cookie_prompt_honours_at_file(tmp_path):
+    """B2: the interactive prompt is the fourth NF1 source, but it must still go
+    through the `@file` convention — otherwise a user who types `@cookie.txt` at the
+    prompt gets that literal 12-char string used as their session cookie, instead of
+    the file's contents, inconsistent with every other source in the chain."""
+    cookie_file = tmp_path / "cookie.txt"
+    cookie_file.write_text("laravel_session=filedata\n", encoding="utf-8")
+    cfg = Config()
+    got = resolve_cookie(None, cfg, env={}, prompt=lambda: f"@{cookie_file}")
+    assert got == "laravel_session=filedata"
+
+
+def test_resolve_cookie_prompt_plain_value_still_passes_through(tmp_path):
+    """A pasted cookie with no leading `@` must still work unchanged after B2."""
+    cfg = Config()
+    got = resolve_cookie(None, cfg, env={}, prompt=lambda: "laravel_session=pasted")
+    assert got == "laravel_session=pasted"

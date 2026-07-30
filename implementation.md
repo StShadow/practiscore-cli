@@ -99,13 +99,14 @@ classDiagram
         +remove(no, pos)
     }
     class MovePlanner {
-        +plan(sids, no) MovePlan
+        +plan(sids, no, roster, position) MovePlan
     }
     class BulkMover {
         +run(plan, ...) list~MoveOutcome~
     }
     class LockManager {
         +ensure(client) LockReport
+        +report(client) LockReport
     }
     class Checkpoint {
         +load() set~int~
@@ -232,7 +233,9 @@ class PlannedMove:
     shooter_name: str
     from_squad: int | None
     to_squad: int
-    kind: str                 # "move" | "add" | "noop(already there)" | "blocked(no free slot)"
+    kind: str                 # "move" | "add" | "noop(already there)"
+                              # | "blocked(no free slot)"      auto-pick ran out of slots
+                              # | "blocked(position occupied)" explicit --position is taken
 
 @dataclass(frozen=True)
 class MovePlan:
@@ -333,7 +336,7 @@ def resolve_cookie(cli_value, cfg) -> str:         # NF1: --cookie > env PRACTIS
 ```python
 class Formatter(Protocol):
     def squads(self, snapshot: MatchSnapshot) -> None: ...
-    def shooters(self, rows: list[Shooter], squad_no: int | None) -> None: ...  # (name, ID); NO email (NF9)
+    def shooters(self, rows: list[ShooterRow]) -> None: ...   # (name, ID); NO email (NF9)
     def plan(self, plan: MovePlan) -> None: ...
     def outcomes(self, outcomes: list[MoveOutcome]) -> None: ...
     def lock(self, report: LockReport) -> None: ...
@@ -501,6 +504,7 @@ practiscore-squads --json move 9808574 --to 3 --dry-run
 ```
 
 - Moves one shooter (by ID) to a displayed squad number; `--position` optional (default first free slot).
+- **The preview honours `--position`.** It classifies against that one scraped slot in the same order `move()` acts on it, so what you confirm is what you get: an unscraped position is `SlotNotFoundError`, an occupied one previews `blocked(position occupied)` instead of promising a move that returns `taken`, and a free slot inside the shooter's *current* squad previews `noop` because the server will answer `same`.
 - Prints a **dry-run** line and asks to confirm (NF5) unless `--yes`, then **locks** the match if unlocked (NF7) and executes. `--dry-run` (D5) prints the plan and exits `0` without executing — same as `move-bulk --dry-run`, and works with `--json`.
 - **A dry run and a declined confirm both leave the lock exactly as found** and report the state they saw (`Lock: UNLOCKED (unchanged — nothing was executed)`). Locking before the prompt would have meant "no" still changed the match.
 - **Audits the attempt** (NF8), success or failure, to the same file `move-bulk` uses; the path is echoed to stderr.
@@ -624,17 +628,13 @@ Loaded only when `slug`+`target_squad`+`notify` match the current run; deleted o
 
 ## 10. Backlog
 
-**Status:** all eight steps of §9 are built. `models`, `errors`, `pacing`, `http`, `parsing`, `client`, `planner`, `checkpoint`, `audit`, `bulk`, `lock`, `config`, `formatting`, the `cli/` package, and `README.md` are implemented, with **194 passing tests** (plus 3 opt-in `sandbox` tests, deselected by default) and a clean `ruff check src/`. What follows is what is left, not what was planned.
+**Status:** all eight steps of §9 are built. `models`, `errors`, `pacing`, `http`, `parsing`, `client`, `planner`, `checkpoint`, `audit`, `bulk`, `lock`, `config`, `formatting`, the `cli/` package, and `README.md` are implemented, with **206 passing tests** (plus 3 opt-in `sandbox` tests, deselected by default) and a clean `ruff check src/`. What follows is what is left, not what was planned.
 
 Each task below is self-contained: it names its own files and its own definition of done. Where a genuine ordering constraint exists it is stated as **Needs:**.
 
 ### 10.1 Open
 
 - [ ] **C4 — Verify the `LIKE` escaping assumption.** `search(literal=True)` escapes `%`/`_` with a backslash, but spec §3.2's verification log never confirmed the backend honours `\` escapes — if it does not, literal searches for names containing `_` silently return the wrong rows. *Done when:* the behaviour is checked against the sandbox and either confirmed in `spec.md` or the escaping strategy is corrected. **Needs:** a sandbox session (§8).
-- [ ] **B1 — Reflect `--position` in the `move` preview.** `move` plans via `MovePlanner.plan([id], to_squad)`, which ignores `--position` and assumes the first free slot; the run then executes against the requested position. With an occupied `--position` the preview says `move` and the result is `taken`. *Done when:* the plan for an explicit `--position` classifies against that slot, with a `CliRunner` test that the preview and the outcome agree.
-- [ ] **B2 — Honour `@file` at the cookie prompt.** `resolve_cookie` runs `_read_cookie_value` on the flag, env, and config paths but returns the interactive prompt's value verbatim, so typing `@cookie.txt` at the prompt is taken as a literal cookie. *Done when:* the prompt result goes through the same reader, with a test.
-- [ ] **B3 — `TableFormatter.shooters` ignores its `squad_no` argument.** The filtering happens in `commands.py` before the call, so the parameter is dead weight in the `Formatter` protocol. *Done when:* either the renderer uses it (e.g. a "Squad N" caption) or it is dropped from the protocol and both implementations.
-- [ ] **B4 — `toggle_lock()` has no 419 refresh-and-retry.** `_check_and_save` re-`refresh()`es and retries once on a 419 (§3.3); the lock toggle does not, so an expired CSRF token during a long run surfaces as `UnexpectedResponseError` instead of recovering. *Done when:* `toggle_lock` retries once on 419, with a test.
 
 ### 10.2 Done
 
@@ -657,6 +657,10 @@ Kept as a record of what the definitions of done were measured against.
 | **P1** — `py.typed` ships | Verified by inspecting a built wheel: contains `practiscore_squads/py.typed`. |
 | **P2** — sandbox suite | 3 opt-in `sandbox`-marked read tests against `test-reverse-engineer`. |
 | **P3** — README matches the CLI | README documents the shipped commands and drops the "not yet built" caveat. |
+| **B1** — `--position` in the `move` preview | `MovePlanner.plan(position=)` classifies against the one scraped slot, mirroring `move()`'s order exactly: unscraped ⇒ `SlotNotFoundError`, occupied ⇒ new `POSITION_TAKEN` kind, free-but-own-squad ⇒ `NOOP` (the server answers `same`), else `MOVE`/`ADD`. Preview and outcome now agree on every branch. |
+| **B2** — `@file` at the cookie prompt | The prompt result goes through `_read_cookie_value`, like the other three NF1 sources. |
+| **B3** — dead `squad_no` on `Formatter.shooters` | **Dropped** from the protocol, both renderers, and the call site. Filtering already happens in `shooters_cmd`, and each `ShooterRow` carries its own `squad_no` as a rendered column, so a caption would only repeat a value already on every row. |
+| **B4** — `toggle_lock()` 419 recovery | One-shot refresh-and-retry matching `_check_and_save`, with the new token. Safe to replay because the endpoint is a pure toggle (§3.7) and a 419 never reaches the toggle logic; the resulting state is derived from the post-refresh snapshot, so a concurrent admin's flip is reflected rather than misreported. A second 419 raises naming that cause. |
 
 ### 10.3 Decided — no action
 

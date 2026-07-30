@@ -6,11 +6,23 @@ import responses
 
 from practiscore_squads.errors import ServerError, UnexpectedResponseError
 
-from tests._data import MATCH_ID, bodies_for, lock_url, path_called
+from tests._data import (
+    CSRF, MATCH_ID, bodies_for, bootstrap_url, build_bootstrap, lock_url, path_called,
+)
+
+NEW_CSRF = "REFRESHEDCSRF0000000000000000000000TEST"
 
 
 def _add_lock(rsps):
     rsps.add(responses.POST, lock_url(), json={"success": True}, content_type="application/json")
+
+
+def _lock_calls(rsps):
+    return [c for c in rsps.calls if "/lock" in c.request.url]
+
+
+def _bootstrap_call_count(rsps) -> int:
+    return sum(1 for c in rsps.calls if c.request.url.rstrip("/").endswith("/squadding"))
 
 
 def test_toggle_lock_returns_new_state(make_client):
@@ -69,4 +81,44 @@ def test_ensure_locked_never_claims_a_lock_it_did_not_take(make_client):
     rsps.add(responses.POST, lock_url(), json={"message": "Server Error"}, status=500)
     with pytest.raises(ServerError):
         c.ensure_locked()
+    assert c.is_locked() is False
+
+
+# -------------------- B4: 419 refresh-and-retry, mirroring _check_and_save -- #
+def test_toggle_lock_retries_once_on_419(make_client):
+    """§3.3: a stale CSRF token (419) triggers exactly one re-refresh + retry.
+
+    The retried POST must carry the NEW token scraped by that refresh, not the
+    stale one from the original snapshot — a naive retry that resends the old
+    `self.snapshot.csrf` captured before the refresh would just 419 again.
+    """
+    c, rsps = make_client(locked=False)
+    rsps.add(responses.POST, lock_url(), status=419, body="")
+    rsps.add(responses.GET, bootstrap_url(),
+             body=build_bootstrap(locked=False).replace(CSRF, NEW_CSRF),
+             content_type="text/html")
+    _add_lock(rsps)
+
+    new_state = c.toggle_lock()
+
+    assert new_state is True
+    assert _bootstrap_call_count(rsps) == 2, "the stale token must force exactly one re-scrape"
+    calls = _lock_calls(rsps)
+    assert len(calls) == 2, "expected the original 419 attempt plus one retry"
+    assert calls[1].request.headers.get("X-CSRF-TOKEN") == NEW_CSRF
+
+
+def test_toggle_lock_does_not_retry_a_second_419(make_client):
+    """Guarded by the same one-shot flag as _check_and_save: a second consecutive
+    419 (token still bad, or some other persistent fault) must raise rather than
+    loop forever re-refreshing."""
+    c, rsps = make_client(locked=False)
+    rsps.add(responses.POST, lock_url(), status=419, body="")
+    rsps.add(responses.GET, bootstrap_url(), body=build_bootstrap(locked=False),
+             content_type="text/html")
+    rsps.add(responses.POST, lock_url(), status=419, body="")
+
+    with pytest.raises(UnexpectedResponseError, match="419"):
+        c.toggle_lock()
+    assert len(_lock_calls(rsps)) == 2, "must not retry past the second 419"
     assert c.is_locked() is False

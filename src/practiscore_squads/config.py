@@ -134,4 +134,7 @@ def resolve_cookie(cli_value: str | None, cfg: Config, *,
     if prompt is None:
         import click
         prompt = lambda: click.prompt("Session cookie", hide_input=True)  # noqa: E731
-    return prompt()
+    # The other three sources all go through _read_cookie_value — an interactive
+    # `@file` paste deserves the same treatment, not a literal 12-char string used
+    # as the session cookie (README teaches `@file` as a universal convention).
+    return _read_cookie_value(prompt())

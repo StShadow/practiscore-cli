@@ -54,7 +54,7 @@ def shooters_cmd(obj, squad_no):
         rows = [ShooterRow(s, name_to_squad.get(s.name)) for s in client.roster()]
         if squad_no is not None:
             rows = [r for r in rows if r.squad_no == squad_no]
-        obj.formatter.shooters(rows, squad_no)
+        obj.formatter.shooters(rows)
 
 
 # ---------------------------------- move -------------------------------------- #
@@ -83,7 +83,10 @@ def move_cmd(obj, shooter_id, to_squad, position, yes, notify, dry_run):
         # audit needs name+email per NF8, and the planner needs the same rows.
         roster = client.roster()
 
-        plan = MovePlanner(client).plan([shooter_id], to_squad, roster=roster)
+        # `position` threaded through so the preview classifies against the same
+        # scraped slot `client.move()` will act on (B1) — otherwise an occupied
+        # explicit slot previews as "move" and comes back "taken" on execution.
+        plan = MovePlanner(client).plan([shooter_id], to_squad, roster=roster, position=position)
         obj.formatter.plan(plan)
 
         if dry_run:

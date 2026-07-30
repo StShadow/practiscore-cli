@@ -262,12 +262,27 @@ class SquadClient:
         return outcomes
 
     # --- lock orchestration (NF7) ------------------------------------------ #
-    def toggle_lock(self) -> bool:
+    def toggle_lock(self, *, _retried_419: bool = False) -> bool:
         parsed = self.http.post(
             f"/matches/{self.slug}/lock",
             data={"matchId": self.snapshot.match_id},
             csrf=self.snapshot.csrf,
         )
+
+        if parsed.status == 419:
+            # Same one-shot recovery as _check_and_save (§3.3). Safe to replay because
+            # the endpoint is a *pure* toggle (§3.7) and a 419 never reached the toggle
+            # logic — so state is unchanged and the retry flips whatever the server
+            # holds now. Everything below reads the post-refresh snapshot, which is why
+            # a concurrent admin's flip is reflected rather than reported wrongly.
+            if _retried_419:
+                raise UnexpectedResponseError(
+                    "lock() rejected the CSRF token twice (419) — the session is no "
+                    "longer usable for writes even after a re-scrape"
+                )
+            self.refresh()
+            return self.toggle_lock(_retried_419=True)
+
         if parsed.status == 500:
             raise ServerError(f"lock toggle failed: {parsed.text}")
         # §3.7/A12: only {"success": true} confirms the toggle happened — anything
